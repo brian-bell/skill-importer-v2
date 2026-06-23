@@ -24,4 +24,6 @@ comptime {
     _ = @import("git.zig");
     _ = @import("repository.zig");
     _ = @import("repository_test.zig");
+    _ = @import("ops.zig");
+    _ = @import("ops_test.zig");
 }

@@ -67,6 +67,21 @@ pub fn writeRepositoryImportResult(w: *std.Io.Writer, r: types.RepositoryImportR
     try w.writeByte('\n');
 }
 
+/// Emit an enable/disable/promote/unpromote/delete result (spec "JSON Schemas >
+/// Skill Operation Result"). Key order mirrors the spec: skill_name, then each
+/// action {action, agent?, path, target?, source?}. The optional `agent`,
+/// `target`, and `source` fields are OMITTED (not null) when absent: `agent`
+/// only for agent-root actions, `target` only for symlink/skip actions involving
+/// an agent entry, `source` only for copy/promotion actions. Ends in exactly one
+/// trailing newline (spec "Output Contract").
+pub fn writeSkillOperationResult(w: *std.Io.Writer, r: types.SkillOperationResult) std.Io.Writer.Error!void {
+    try std.json.Stringify.value(r, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    }, w);
+    try w.writeByte('\n');
+}
+
 /// Write an enum value as its snake_case wire token (a bare JSON string).
 /// `std.json.Stringify` serializes a Zig enum as its `@tagName`, which is exactly
 /// the spec spelling for every domain enum.
@@ -155,4 +170,94 @@ test "RepoImportKind tokens (spec Repository Import Result: kind)" {
     try expectToken(types.RepoImportKind.imported, "imported");
     try expectToken(types.RepoImportKind.imported_batch, "imported_batch");
     try expectToken(types.RepoImportKind.selection, "selection");
+}
+
+// ---------------------------------------------------------------------------
+// Skill Operation Result wire-level contracts (spec "JSON Schemas > Skill
+// Operation Result"; "Output Contract"). Locks key order, omit-vs-null for the
+// optional `agent`/`target`/`source` fields, and the single trailing newline.
+// ---------------------------------------------------------------------------
+
+fn renderOpResult(r: types.SkillOperationResult) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer aw.deinit();
+    try writeSkillOperationResult(&aw.writer, r);
+    return aw.toOwnedSlice();
+}
+
+test "SkillOperationResult: enable create_symlink emits action,agent,path,target in order; no source key" {
+    // spec "Skill Operation Result": wire key order action, agent, path, target;
+    // `agent` present for agent-root actions, `target` present for symlink
+    // actions, `source` OMITTED (not null) when absent.
+    const r: types.SkillOperationResult = .{
+        .skill_name = "example-skill",
+        .actions = &.{.{
+            .action = .create_symlink,
+            .agent = .codex,
+            .path = "/abs/.agents/skills/example-skill",
+            .target = "/abs/agent-skills/example-skill",
+        }},
+    };
+    const json = try renderOpResult(r);
+    defer testing.allocator.free(json);
+
+    // Key order within the action object: action < agent < path < target.
+    const i_action = std.mem.indexOf(u8, json, "\"action\"").?;
+    const i_agent = std.mem.indexOf(u8, json, "\"agent\"").?;
+    const i_path = std.mem.indexOf(u8, json, "\"path\"").?;
+    const i_target = std.mem.indexOf(u8, json, "\"target\"").?;
+    try testing.expect(i_action < i_agent);
+    try testing.expect(i_agent < i_path);
+    try testing.expect(i_path < i_target);
+    // `source` is absent => OMITTED, not emitted as null.
+    try testing.expect(std.mem.indexOf(u8, json, "\"source\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"agent\": \"codex\"") != null);
+    // Exactly one trailing newline (spec "Output Contract").
+    try testing.expect(json[json.len - 1] == '\n');
+    try testing.expect(json[json.len - 2] != '\n');
+}
+
+test "SkillOperationResult: collection action omits agent (spec: agent omitted for collection actions)" {
+    // spec "Skill Operation Result": "`agent` is ... omitted for collection
+    // actions." A remove_directory on the collection (no agent) must NOT emit
+    // an `agent` key or `agent: null`.
+    const r: types.SkillOperationResult = .{
+        .skill_name = "example-skill",
+        .actions = &.{.{
+            .action = .remove_directory,
+            .agent = null,
+            .path = "/abs/agent-skills/example-skill",
+        }},
+    };
+    const json = try renderOpResult(r);
+    defer testing.allocator.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"agent\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"target\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"action\": \"remove_directory\"") != null);
+}
+
+test "SkillOperationResult: disable skip_unchanged omits target when missing-entry (spec: target absent)" {
+    // spec "Skill Operation Result": "`target` is present for symlink actions and
+    // skip actions involving an agent entry." A disable skip for a MISSING entry
+    // has no target => the `target` key must be OMITTED, not null.
+    const r: types.SkillOperationResult = .{
+        .skill_name = "example-skill",
+        .actions = &.{.{
+            .action = .skip_unchanged,
+            .agent = .claude_code,
+            .path = "/abs/.claude/skills/example-skill",
+            .target = null,
+        }},
+    };
+    const json = try renderOpResult(r);
+    defer testing.allocator.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"target\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"agent\": \"claude_code\"") != null);
+    try testing.expect(json[json.len - 1] == '\n');
+    try testing.expect(json[json.len - 2] != '\n');
 }
