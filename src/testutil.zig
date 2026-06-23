@@ -209,6 +209,64 @@ pub const FixedClock = struct {
     }
 };
 
+/// A clock that returns a different timestamp on every call (advancing by
+/// `step` each `now()`). Used to prove that `imported_at` is read from a SINGLE
+/// `clock.now()` call: any code path that calls `now()` more than once would
+/// observe diverging timestamps (a FixedClock masks such a bug).
+pub const IncrementingClock = struct {
+    value: i64,
+    step: i64 = 1,
+    calls: usize = 0,
+
+    pub fn clock(self: *IncrementingClock) Clock {
+        return .{ .nowFn = nowImpl, .ctx = self };
+    }
+
+    fn nowImpl(ctx: *anyopaque) i64 {
+        const self: *IncrementingClock = @ptrCast(@alignCast(ctx));
+        const v = self.value;
+        self.value += self.step;
+        self.calls += 1;
+        return v;
+    }
+};
+
+/// A `std.Io` wrapper that delegates to the real test IO for everything EXCEPT
+/// creating a file whose basename equals `fail_basename`, which it fails with
+/// `error.AccessDenied`. This injects a deterministic, cross-platform failure
+/// AFTER the import directory is created (e.g. the `import.json` write), so the
+/// genuine partial-write rollback path (deleteTree of a directory WE created) is
+/// exercised — a real filesystem cannot reproduce this without the seam because
+/// any pre-placed entry at the target either trips the collision check (a
+/// same-name directory) or fails `createDirPath` before any action is recorded
+/// (a file/symlink at the path). Single-threaded test use only.
+pub const FailingIo = struct {
+    var vtable: std.Io.VTable = undefined;
+    var orig_create: *const fn (?*anyopaque, std.Io.Dir, []const u8, std.Io.Dir.CreateFileOptions) std.Io.File.OpenError!std.Io.File = undefined;
+    var fail_basename: []const u8 = "";
+
+    /// Build a failing IO that fails `dirCreateFile` for the given basename.
+    pub fn forBasename(basename: []const u8) std.Io {
+        vtable = io.vtable.*;
+        orig_create = vtable.dirCreateFile;
+        fail_basename = basename;
+        vtable.dirCreateFile = createFileOverride;
+        return .{ .userdata = io.userdata, .vtable = &vtable };
+    }
+
+    fn createFileOverride(
+        ud: ?*anyopaque,
+        dir: std.Io.Dir,
+        sub_path: []const u8,
+        opts: std.Io.Dir.CreateFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        if (std.mem.eql(u8, std.fs.path.basename(sub_path), fail_basename)) {
+            return error.AccessDenied;
+        }
+        return orig_create(ud, dir, sub_path, opts);
+    }
+};
+
 /// Network fetcher abstraction. The canonical interface lives in net.zig so the
 /// real (std.http-backed) and fake fetchers share one type; re-exported here for
 /// test convenience (zig-clean-room-cli.md: fake net provider).

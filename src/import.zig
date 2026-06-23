@@ -206,19 +206,11 @@ fn store(c: *Context, plan: Plan) Result {
     const skill_dir = std.fs.path.join(c.arena, &.{ c.imports_root, plan.name }) catch return oom();
     const manifest_path = std.fs.path.join(c.arena, &.{ skill_dir, "import.json" }) catch return oom();
 
-    var actions: std.ArrayList(types.ImportAction) = .empty;
-
-    // Execute; on any failure roll back the created skill directory so no
-    // partial import survives (spec "Filesystem Safety"). Only delete the skill
-    // directory if WE created it — never remove a pre-existing entry that the
-    // create step failed against (spec: do not remove external entries).
-    executeStore(c, plan, skill_dir, manifest_path, &actions) catch |err| {
-        const created_dir = actions.items.len > 0 and actions.items[0].action == .create_directory;
-        if (created_dir) rollback(c, skill_dir);
-        if (err == error.OutOfMemory) return oom();
-        return ioErr("write import storage", skill_dir);
-    };
-
+    // Build the manifest ONCE so the bytes written to disk and the manifest
+    // returned to the caller are identical (spec "JSON Schemas > Import Result":
+    // the result manifest IS what is persisted in import.json). In particular
+    // `imported_at` is read from a SINGLE clock.now() call; computing it twice
+    // (once for disk, once for the result) could diverge under a real wall clock.
     const manifest: types.ImportManifest = .{
         .source_type = plan.source_type,
         .source_location = plan.source_location,
@@ -226,6 +218,19 @@ fn store(c: *Context, plan: Plan) Result {
         .imported_at = c.clock.now(),
         .content_hash = plan.content_hash,
         .promoted = false,
+    };
+
+    var actions: std.ArrayList(types.ImportAction) = .empty;
+
+    // Execute; on any failure roll back the created skill directory so no
+    // partial import survives (spec "Filesystem Safety"). Only delete the skill
+    // directory if WE created it — never remove a pre-existing entry that the
+    // create step failed against (spec: do not remove external entries).
+    executeStore(c, plan, manifest, skill_dir, manifest_path, &actions) catch |err| {
+        const created_dir = actions.items.len > 0 and actions.items[0].action == .create_directory;
+        if (created_dir) rollback(c, skill_dir);
+        if (err == error.OutOfMemory) return oom();
+        return ioErr("write import storage", skill_dir);
     };
 
     return .{ .ok = .{
@@ -240,6 +245,7 @@ fn store(c: *Context, plan: Plan) Result {
 fn executeStore(
     c: *Context,
     plan: Plan,
+    manifest: types.ImportManifest,
     skill_dir: []const u8,
     manifest_path: []const u8,
     actions: *std.ArrayList(types.ImportAction),
@@ -265,15 +271,9 @@ fn executeStore(
         try actions.append(c.arena, .{ .action = .write_skill, .path = skill_path });
     }
 
-    // write_manifest (no trailing newline on disk).
-    const manifest: types.ImportManifest = .{
-        .source_type = plan.source_type,
-        .source_location = plan.source_location,
-        .source_repository = null,
-        .imported_at = c.clock.now(),
-        .content_hash = plan.content_hash,
-        .promoted = false,
-    };
+    // write_manifest (no trailing newline on disk). Serialize the SAME manifest
+    // value that store() returns, so the on-disk imported_at/content_hash match
+    // the result exactly.
     const bytes = try manifest_mod.toBytes(c.arena, manifest);
     try cwd.writeFile(c.io, .{ .sub_path = manifest_path, .data = bytes });
     try actions.append(c.arena, .{ .action = .write_manifest, .path = manifest_path });

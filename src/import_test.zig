@@ -15,6 +15,7 @@ const io = std.testing.io;
 const importmod = @import("import.zig");
 const types = @import("types.zig");
 const json_out = @import("json_out.zig");
+const manifest_mod = @import("manifest.zig");
 const testutil = @import("testutil.zig");
 const net = @import("net.zig");
 
@@ -438,4 +439,92 @@ test "import result renders the spec JSON shape with a trailing newline" {
     try testing.expect(std.unicode.utf8ValidateSlice(json));
     try testing.expect(json[json.len - 1] == '\n');
     try testing.expect(json[json.len - 2] != '\n');
+}
+
+// --- the imported_at persisted in import.json equals the imported_at in the
+// returned result (spec "Import Manifest": imported_at; "JSON Schemas > Import
+// Result": the same manifest object). The clock advances on every call, so a
+// second clock.now() for the on-disk write would diverge from the result. ---
+
+test "import markdown persists the same imported_at on disk and in the result" {
+    var h = try Harness.init();
+    defer h.deinit();
+    // A clock that advances on EVERY call. If store() and executeStore() each
+    // call clock.now() independently, the on-disk imported_at and the result's
+    // imported_at differ and this test fails.
+    var clk: testutil.IncrementingClock = .{ .value = 1710000000, .step = 1000 };
+    var c: importmod.Context = .{
+        .arena = h.arena(),
+        .io = io,
+        .imports_root = h.roots.imports,
+        .canonical_root = h.roots.canonical,
+        .clock = clk.clock(),
+    };
+
+    const res = importmod.markdown(&c, valid_md, "clipboard");
+    const r = switch (res) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+
+    // Read import.json from disk and parse its imported_at.
+    const bytes = try h.readImports("alpha/import.json");
+    const parsed = try manifest_mod.parse(testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try testing.expectEqual(r.manifest.imported_at, parsed.value.imported_at);
+    // And exactly ONE now() call was made for this import.
+    try testing.expectEqual(@as(usize, 1), clk.calls);
+}
+
+// --- import path: the source path argument is ITSELF a symlink (spec "import
+// path": "Symlinks and unsupported filesystem entries are rejected."). This
+// guards the top-level classification branch, distinct from a symlink found
+// *inside* a source directory. ---
+
+test "import path rejects a source path that is itself a symlink and writes nothing" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+    // A real skill directory, plus a symlink pointing at it.
+    try fx.writeSkill("src/alpha", "alpha", "Alpha.");
+    try fx.symlink("alpha", "src/alpha-link");
+    const link_path = try std.fs.path.join(h.arena(), &.{ h.roots.base, "src", "alpha-link" });
+
+    var c = h.ctx();
+    try expectErr(importmod.path(&c, link_path), .unsupported_entry);
+    // No import storage was created.
+    try testing.expect(!h.importsExists("alpha"));
+    try testing.expect(!h.importsExists("alpha-link"));
+}
+
+// --- partial-write rollback: a failure AFTER create_directory must delete the
+// directory WE created, leaving no partial storage (spec "Filesystem Safety":
+// plan-then-execute; "leave no partial storage on failure"; Recommended TDD
+// Acceptance Suite: "Markdown imports ... leave no partial storage on
+// failure"). An injected IO fails the import.json write so create_directory
+// succeeds first, driving the genuine rollback deleteTree branch. ---
+
+test "import markdown rolls back the created directory when a later write fails" {
+    var h = try Harness.init();
+    defer h.deinit();
+    // IO that lets the directory + SKILL.md be created, but fails the
+    // import.json write — the only step after create_directory.
+    const failing_io = testutil.FailingIo.forBasename("import.json");
+    var c: importmod.Context = .{
+        .arena = h.arena(),
+        .io = failing_io,
+        .imports_root = h.roots.imports,
+        .canonical_root = h.roots.canonical,
+        .clock = h.clock(),
+    };
+
+    const res = importmod.markdown(&c, valid_md, null);
+    try testing.expect(res == .err);
+
+    // The directory we created (and its partial SKILL.md) were rolled back:
+    // nothing remains under imports/alpha.
+    try testing.expect(!h.importsExists("alpha"));
+    try testing.expect(!h.importsExists("alpha/SKILL.md"));
+    try testing.expect(!h.importsExists("alpha/import.json"));
 }
