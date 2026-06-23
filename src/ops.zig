@@ -116,10 +116,15 @@ fn runImpl(c: *Context, skill_name: []const u8, agents: []const types.Agent, mod
         try plans.append(c.arena, plan);
     }
 
-    // 4. Execute (spec: only after preflight succeeds).
+    // 4. Execute (spec: only after preflight succeeds). On an execute-phase I/O
+    //    error, surface the actions that completed before the failure (spec
+    //    "Filesystem Safety": report the completed actions; Findings #10/#12),
+    //    mirroring promote/unpromote/delete.
     var actions: std.ArrayList(types.SkillAction) = .empty;
     for (plans.items) |plan| {
-        try execute(c, plan, &actions);
+        execute(c, plan, &actions) catch |err| {
+            return executeError(c, skill_name, err, &actions);
+        };
     }
 
     return .{ .ok = .{

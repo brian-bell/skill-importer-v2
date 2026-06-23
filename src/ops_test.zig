@@ -74,6 +74,17 @@ fn expectOk(res: result.Result(types.SkillOperationResult)) !types.SkillOperatio
     }
 }
 
+/// Return the ErrorInfo of an expected-error result so a test can inspect its
+/// `kind`, `path`, and `partial_actions` (spec "Filesystem Safety": a partially
+/// completed operation should report the actions that completed before the
+/// failure).
+fn expectErr(res: result.Result(types.SkillOperationResult)) !result.ErrorInfo {
+    switch (res) {
+        .ok => return error.ExpectedError,
+        .err => |e| return e,
+    }
+}
+
 /// No-follow entry kind of `rel` under the temp base; missing => null.
 fn entryKind(h: *Harness, rel: []const u8) !?std.Io.File.Kind {
     const st = h.roots.dir().statFile(io, rel, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -524,4 +535,72 @@ test "disable: broken managed symlink is unsafe and left on disk (spec disable, 
     // The broken symlink is still on disk, untouched, and still dangling.
     try testing.expectEqual(std.Io.File.Kind.sym_link, (try entryKind(&h, "claude/brk")).?);
     try testing.expectError(error.FileNotFound, h.roots.dir().statFile(io, "claude/brk", .{ .follow_symlinks = true }));
+}
+
+// --- enable/disable: execute-phase I/O failure reports the completed actions
+// in partial_actions (spec "Filesystem Safety": "Partially completed operations
+// caused by unexpected I/O errors should report the actions that completed before
+// the failure"). Findings #10/#12: enable/disable previously discarded the
+// completed-action list on an execute-phase I/O failure, unlike promote/unpromote/
+// delete which thread the accumulated actions into the error path. ---
+
+test "enable: execute-phase symlink failure on the 2nd agent reports the 1st agent's create_symlink in partial_actions (spec Filesystem Safety, Findings #10/#12)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.fixtures().writeSkill("canonical/part-e", "part-e", "Partial enable.");
+    // Pre-create both agent roots so execute emits only create_symlink actions
+    // (no create_directory noise) — the 1st agent's create_symlink is the action
+    // that must survive in partial_actions.
+    try h.roots.makeRoot(.claude);
+    try h.roots.makeRoot(.codex);
+
+    // Fail the codex agent's symLink (requested 2nd) while claude-code's (1st)
+    // succeeds. Keying on the codex root path fails ONLY <codex>/part-e.
+    const failing_io = testutil.FailingSymlinkIo.forLinkContaining(h.roots.codex);
+    var c = h.ctx();
+    c.io = failing_io;
+
+    // Requested order claude-code then codex: claude-code's create_symlink lands,
+    // then codex's symLink fails with an unexpected I/O error.
+    const e = try expectErr(ops.enable(&c, "part-e", &.{ .claude_code, .codex }));
+    try testing.expectEqual(result.ErrorKind.io_error, e.kind);
+
+    // The already-created claude-code symlink action must be surfaced, not
+    // silently discarded.
+    try testing.expect(e.partial_actions.items.len > 0);
+    var saw_claude_create = false;
+    for (e.partial_actions.items) |a| {
+        if (a.action == .create_symlink and a.agent == .claude_code) saw_claude_create = true;
+    }
+    try testing.expect(saw_claude_create);
+    // The claude-code symlink really is on disk (the action reflects reality).
+    try testing.expectEqual(std.Io.File.Kind.sym_link, (try entryKind(&h, "claude/part-e")).?);
+}
+
+test "disable: execute-phase removal failure on the 2nd agent reports the 1st agent's remove_symlink in partial_actions (spec Filesystem Safety, Findings #10/#12)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.fixtures().writeSkill("canonical/part-d", "part-d", "Partial disable.");
+    // Both agents have the correct managed symlink to the canonical copy.
+    try h.fixtures().managedSymlink(.claude, "part-d", .canonical, "part-d");
+    try h.fixtures().managedSymlink(.codex, "part-d", .canonical, "part-d");
+
+    // Fail the codex agent's deleteFile (requested 2nd) while claude-code's (1st)
+    // removal succeeds. Keying on the codex root path fails ONLY <codex>/part-d.
+    const failing_io = testutil.FailingDeleteFileIo.forPathContaining(h.roots.codex);
+    var c = h.ctx();
+    c.io = failing_io;
+
+    const e = try expectErr(ops.disable(&c, "part-d", &.{ .claude_code, .codex }));
+    try testing.expectEqual(result.ErrorKind.io_error, e.kind);
+
+    // The already-completed claude-code remove_symlink action must be surfaced.
+    try testing.expect(e.partial_actions.items.len > 0);
+    var saw_claude_remove = false;
+    for (e.partial_actions.items) |a| {
+        if (a.action == .remove_symlink and a.agent == .claude_code) saw_claude_remove = true;
+    }
+    try testing.expect(saw_claude_remove);
+    // The claude-code symlink really was removed (the action reflects reality).
+    try testing.expectEqual(@as(?std.Io.File.Kind, null), try entryKind(&h, "claude/part-d"));
 }

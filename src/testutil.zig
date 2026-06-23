@@ -285,6 +285,77 @@ pub const FailingIo = struct {
 };
 
 /// A `std.Io` wrapper that delegates to the real test IO for everything EXCEPT a
+/// `symLink` whose SYM-LINK (new) path CONTAINS `fail_link_substr`, which it
+/// fails with `error.AccessDenied`. Keying on a path substring (e.g. the codex
+/// agent root) lets a test fail the symlink for ONE specific agent entry (the 2nd
+/// agent's `<codex>/<skill>`) while the earlier agent's `<claude>/<skill>` symlink
+/// succeeds — driving enable's execute-phase partial-failure reporting (spec
+/// "Filesystem Safety": report the actions that completed before the failure).
+/// Single-threaded test use only.
+pub const FailingSymlinkIo = struct {
+    var vtable: std.Io.VTable = undefined;
+    var orig_symlink: *const fn (?*anyopaque, std.Io.Dir, []const u8, []const u8, std.Io.Dir.SymLinkFlags) std.Io.Dir.SymLinkError!void = undefined;
+    var fail_link_substr: []const u8 = "";
+
+    /// Build a failing IO that fails `dirSymLink` when the sym-link (new) path
+    /// contains `link_substr`.
+    pub fn forLinkContaining(link_substr: []const u8) std.Io {
+        vtable = io.vtable.*;
+        orig_symlink = vtable.dirSymLink;
+        fail_link_substr = link_substr;
+        vtable.dirSymLink = symLinkOverride;
+        return .{ .userdata = io.userdata, .vtable = &vtable };
+    }
+
+    fn symLinkOverride(
+        ud: ?*anyopaque,
+        dir: std.Io.Dir,
+        target_path: []const u8,
+        sym_link_path: []const u8,
+        flags: std.Io.Dir.SymLinkFlags,
+    ) std.Io.Dir.SymLinkError!void {
+        if (std.mem.indexOf(u8, sym_link_path, fail_link_substr) != null) {
+            return error.AccessDenied;
+        }
+        return orig_symlink(ud, dir, target_path, sym_link_path, flags);
+    }
+};
+
+/// A `std.Io` wrapper that delegates to the real test IO for everything EXCEPT a
+/// `deleteFile` whose path CONTAINS `fail_substr`, which it fails with
+/// `error.AccessDenied`. Lets a test fail the symlink removal for ONE specific
+/// agent entry (the 2nd agent's `<codex>/<skill>`) while the earlier agent's
+/// `<claude>/<skill>` removal succeeds — driving disable's execute-phase
+/// partial-failure reporting (spec "Filesystem Safety"). Single-threaded test
+/// use only.
+pub const FailingDeleteFileIo = struct {
+    var vtable: std.Io.VTable = undefined;
+    var orig_delete: *const fn (?*anyopaque, std.Io.Dir, []const u8) std.Io.Dir.DeleteFileError!void = undefined;
+    var fail_substr: []const u8 = "";
+
+    /// Build a failing IO that fails `dirDeleteFile` when the path contains
+    /// `substr`.
+    pub fn forPathContaining(substr: []const u8) std.Io {
+        vtable = io.vtable.*;
+        orig_delete = vtable.dirDeleteFile;
+        fail_substr = substr;
+        vtable.dirDeleteFile = deleteFileOverride;
+        return .{ .userdata = io.userdata, .vtable = &vtable };
+    }
+
+    fn deleteFileOverride(
+        ud: ?*anyopaque,
+        dir: std.Io.Dir,
+        sub_path: []const u8,
+    ) std.Io.Dir.DeleteFileError!void {
+        if (std.mem.indexOf(u8, sub_path, fail_substr) != null) {
+            return error.AccessDenied;
+        }
+        return orig_delete(ud, dir, sub_path);
+    }
+};
+
+/// A `std.Io` wrapper that delegates to the real test IO for everything EXCEPT a
 /// `rename` whose SOURCE (old) path basename equals `fail_old_basename`, which it
 /// fails with `error.CrossDevice`. Keying on the source basename lets
 /// a test fail one specific rename (e.g. the promote `.<name>.staging -> <name>`
