@@ -34,6 +34,11 @@ pub const Provider = struct {
 pub const RealProvider = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// Executable used as `argv[0]` for the clone. Defaults to `"git"` (resolved
+    /// via PATH). Injectable so error-mapping tests can point it at a missing
+    /// path (spawn `FileNotFound` -> `GitUnavailable`) or a stub that exits
+    /// non-zero (-> `RepositoryError`) without touching the process environment.
+    git_path: []const u8 = "git",
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) RealProvider {
         return .{ .gpa = gpa, .io = io };
@@ -46,7 +51,7 @@ pub const RealProvider = struct {
     fn checkoutImpl(ctx: *anyopaque, repository: []const u8, dest_path: []const u8) Provider.CheckoutError!void {
         const self: *RealProvider = @ptrCast(@alignCast(ctx));
         const res = std.process.run(self.gpa, self.io, .{
-            .argv = &.{ "git", "clone", "--depth", "1", repository, dest_path },
+            .argv = &.{ self.git_path, "clone", "--depth", "1", repository, dest_path },
         }) catch |err| switch (err) {
             // No `git` binary on PATH (zig-clean-room-cli.md: spawn FileNotFound
             // -> "git not installed").
@@ -61,3 +66,65 @@ pub const RealProvider = struct {
         }
     }
 };
+
+// --- RealProvider error-mapping tests --------------------------------------
+//
+// These exercise the REAL `std.process.run` path (only `FakeProvider` is used
+// elsewhere). `git_path` is injected so we control the spawned executable
+// without mutating the process environment (SAFETY: no real roots touched; the
+// only filesystem writes are inside a `std.testing.tmpDir`).
+
+const testing = std.testing;
+const test_io = std.testing.io;
+
+// A `git` binary that cannot be spawned (`spawn` returns `error.FileNotFound`)
+// must map to `GitUnavailable` so the CLI can report "git not installed"
+// (zig-clean-room-cli.md Phase 4b). We point `git_path` at an absolute path that
+// does not exist: an absolute `argv[0]` bypasses PATH, so the exec fails with
+// `FileNotFound`.
+test "RealProvider: a missing git executable maps to GitUnavailable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(test_io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+
+    const missing_git = try std.fs.path.join(testing.allocator, &.{ base, "definitely-not-git" });
+    defer testing.allocator.free(missing_git);
+    const dest = try std.fs.path.join(testing.allocator, &.{ base, "checkout" });
+    defer testing.allocator.free(dest);
+
+    var rp = RealProvider.init(testing.allocator, test_io);
+    rp.git_path = missing_git;
+    try testing.expectError(error.GitUnavailable, rp.provider().checkout("https://example.test/x.git", dest));
+}
+
+// A `git` that runs but exits non-zero must map to `RepositoryError` (the spec's
+// fetch/open failure). We stub a tiny executable shell script that always exits
+// 1, point `git_path` at it, and assert the mapping. (POSIX-only; on Windows the
+// stub mechanism would differ, but the clean-room target is POSIX.)
+test "RealProvider: a non-zero git exit maps to RepositoryError" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realPathFileAlloc(test_io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+
+    // Write an executable stub that exits non-zero regardless of arguments.
+    {
+        var f = try tmp.dir.createFile(test_io, "fakegit", .{ .permissions = .executable_file });
+        defer f.close(test_io);
+        try f.writeStreamingAll(test_io, "#!/bin/sh\nexit 7\n");
+    }
+
+    const stub = try std.fs.path.join(testing.allocator, &.{ base, "fakegit" });
+    defer testing.allocator.free(stub);
+    const dest = try std.fs.path.join(testing.allocator, &.{ base, "checkout" });
+    defer testing.allocator.free(dest);
+
+    var rp = RealProvider.init(testing.allocator, test_io);
+    rp.git_path = stub;
+    try testing.expectError(error.RepositoryError, rp.provider().checkout("https://example.test/x.git", dest));
+}

@@ -262,7 +262,7 @@ fn failMsg(io: std.Io, message: []const u8) !u8 {
 /// specific path/URL/repository/skill where available (spec "Output Contract":
 /// "Error text should include the failing operation and the specific path, URL,
 /// repository, or skill name where applicable").
-fn errorMessage(arena: std.mem.Allocator, e: result.ErrorInfo) ![]const u8 {
+pub fn errorMessage(arena: std.mem.Allocator, e: result.ErrorInfo) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
     try w.writeAll(kindMessage(e.kind));

@@ -862,6 +862,240 @@ test "repository import: real git provider clones and imports a local repo" {
     try testing.expect(h.importsExists("repo-real/SKILL.md"));
 }
 
+// --- SUCCESS path: a repository skill with supporting files AND nested
+// sub-directories copies EVERY file to the import on disk (spec "import
+// repository": "Regular files and directories are recursively copied"; "import
+// path": "The directory content hash includes supporting files and relative
+// paths"). Today support files are only used to FORCE FAILURE in tests; this
+// proves the happy path actually materializes the nested tree on disk. A
+// regression that copied only SKILL.md, or flattened nested dirs, fails here. ---
+
+test "repository import: support files and nested subdirs are copied onto disk" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    // One valid skill carrying a top-level support file plus a TWO-level nested
+    // sub-directory tree.
+    try fx.writeSkill("repo/nested-skill", "nested-skill", "Has supporting files.");
+    try fx.writeSupportFile("repo/nested-skill", "helper.txt", "top-level support");
+    try fx.writeSupportFile("repo/nested-skill/docs", "guide.md", "doc body");
+    try fx.writeSupportFile("repo/nested-skill/docs/img", "diagram.svg", "<svg/>");
+    var fp: testutil.FakeProvider = .{ .source_tree = try h.srcTree("repo") };
+
+    var c = h.ctx();
+    const res = repository.import(&c, fp.provider(), "https://example.test/skills.git", no_select);
+    const r = switch (res) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+    try testing.expect(r == .imported);
+
+    // Every file landed on disk at the right relative path with the right bytes.
+    try testing.expect(h.importsExists("nested-skill/SKILL.md"));
+    try testing.expectEqualStrings("top-level support", try h.readImports("nested-skill/helper.txt"));
+    try testing.expectEqualStrings("doc body", try h.readImports("nested-skill/docs/guide.md"));
+    try testing.expectEqualStrings("<svg/>", try h.readImports("nested-skill/docs/img/diagram.svg"));
+
+    // The recorded actions begin with create_directory, end with write_manifest,
+    // and include a copy_file for the deepest nested support file (relative path
+    // preserved).
+    const single = r.imported;
+    try testing.expectEqual(types.ImportActionKind.create_directory, single.actions[0].action);
+    try testing.expectEqual(types.ImportActionKind.write_manifest, single.actions[single.actions.len - 1].action);
+    var saw_deep = false;
+    for (single.actions) |a| {
+        if (a.action == .copy_file and std.mem.endsWith(u8, a.path, std.fs.path.join(h.arena(), &.{ "docs", "img", "diagram.svg" }) catch "diagram.svg")) saw_deep = true;
+    }
+    try testing.expect(saw_deep);
+}
+
+// --- on-disk import.json for a repository import (spec "Import Manifest"): a
+// repository manifest serializes `source_repository`, `content_hash` is
+// `sha256:`-prefixed, `imported_at` is present (from the injected clock), there
+// is NO trailing newline (zig-clean-room-cli.md "Decisions locked in"), and the
+// recorded actions array contains create_directory / copy_file* / write_manifest
+// (spec "Import Result": Import action values). The IncrementingClock proves the
+// persisted timestamp is the same single now() value used in the manifest. ---
+
+test "repository import: on-disk import.json carries source_repository, sha256 hash, imported_at, no trailing newline" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    try fx.writeSkill("repo/repo-alpha", "repo-alpha", "First repository skill.");
+    try fx.writeSupportFile("repo/repo-alpha", "extra.txt", "data");
+    var fp: testutil.FakeProvider = .{ .source_tree = try h.srcTree("repo") };
+
+    // A clock that advances every call so a double-now would diverge.
+    var clk: testutil.IncrementingClock = .{ .value = 1710000123, .step = 7 };
+    var c: repository.Context = .{
+        .arena = h.arena(),
+        .io = io,
+        .imports_root = h.roots.imports,
+        .canonical_root = h.roots.canonical,
+        .clock = clk.clock(),
+    };
+
+    const res = repository.import(&c, fp.provider(), "https://example.test/skills.git", no_select);
+    const r = switch (res) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+    try testing.expect(r == .imported);
+    const single = r.imported;
+
+    // Recorded actions: create_directory first, write_manifest last, at least one
+    // copy_file (SKILL.md + extra.txt => two).
+    try testing.expectEqual(types.ImportActionKind.create_directory, single.actions[0].action);
+    try testing.expectEqual(types.ImportActionKind.write_manifest, single.actions[single.actions.len - 1].action);
+    var copies: usize = 0;
+    for (single.actions) |a| {
+        if (a.action == .copy_file) copies += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), copies);
+
+    // Read the persisted import.json and assert the spec fields are on disk.
+    const bytes = try h.readImports("repo-alpha/import.json");
+
+    // source_repository (with repository + skill_path) is serialized to disk.
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"source_repository\"") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"repository\": \"https://example.test/skills.git\"") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"skill_path\": \"repo-alpha\"") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"source_type\": \"repository\"") != null);
+
+    // content_hash is sha256:-prefixed.
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"content_hash\": \"sha256:") != null);
+
+    // imported_at present and equal to the single observed clock value (the first
+    // tick, 1710000123); exactly one now() call was made.
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"imported_at\": 1710000123") != null);
+    try testing.expectEqual(@as(usize, 1), clk.calls);
+    try testing.expectEqual(@as(i64, 1710000123), single.manifest.imported_at);
+
+    // No trailing newline on disk.
+    try testing.expect(bytes.len > 0);
+    try testing.expect(bytes[bytes.len - 1] != '\n');
+}
+
+// --- imports-root collision on the SINGLE (no-select) auto-import path (spec
+// "Collision Rules" > "Import commands": "Refuse collisions within imports root
+// by directory name"). Only the BATCH path was covered before; this locks the
+// single auto-import path too. A pre-existing imports/<name> directory must make
+// the auto-import fail with import_collision and leave the existing skill intact. ---
+
+test "repository import: single auto-import refuses an imports-root directory-name collision" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    // A pre-existing imported skill occupying the destination directory name.
+    try fx.writeSkill("imports/solo", "solo", "Existing solo.");
+    // The repository's single skill resolves to the same directory name "solo".
+    try fx.writeSkill("repo/solo", "solo", "Repo solo.");
+    var fp: testutil.FakeProvider = .{ .source_tree = try h.srcTree("repo") };
+
+    var c = h.ctx();
+    try expectErr(
+        repository.import(&c, fp.provider(), "https://example.test/skills.git", no_select),
+        .import_collision,
+    );
+    // The pre-existing skill is left untouched (not overwritten by the repo copy).
+    const existing = try h.readImports("solo/SKILL.md");
+    try testing.expect(std.mem.indexOf(u8, existing, "Existing solo.") != null);
+}
+
+// --- imports-root collision by SKILL.md FRONTMATTER NAME when the directory name
+// differs (spec "Collision Rules" > "Import commands": "Refuse collisions within
+// imports root by ... SKILL.md frontmatter name"). The existing import lives in a
+// DIFFERENT directory but has the same frontmatter name as the incoming skill. ---
+
+test "repository import: single auto-import refuses a frontmatter-name collision with a differently-named dir" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    // Pre-existing import in directory "legacy-dir" but frontmatter name "shared".
+    try fx.writeSkill("imports/legacy-dir", "shared", "Old shared.");
+    // The repository's single skill has frontmatter name "shared" too (dir "shared").
+    try fx.writeSkill("repo/shared", "shared", "New shared.");
+    var fp: testutil.FakeProvider = .{ .source_tree = try h.srcTree("repo") };
+
+    var c = h.ctx();
+    try expectErr(
+        repository.import(&c, fp.provider(), "https://example.test/skills.git", no_select),
+        .import_collision,
+    );
+    // Nothing new was written under the "shared" directory name.
+    try testing.expect(!h.importsExists("shared"));
+    // The pre-existing import is untouched.
+    const existing = try h.readImports("legacy-dir/SKILL.md");
+    try testing.expect(std.mem.indexOf(u8, existing, "Old shared.") != null);
+}
+
+// --- canonical collisions are ALLOWED as replacement drafts (spec "Collision
+// Rules" > "Import commands": "Allow collisions with canonical root ... supports
+// replacement drafts"; "Repository batch import": "Allow canonical collisions as
+// replacement drafts"). A pre-existing canonical skill with the SAME frontmatter
+// name must NOT block the repository import. ---
+
+test "repository import: a colliding canonical skill does not block the import (replacement draft)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    // A canonical skill already named "repo-alpha".
+    try fx.writeSkill("canonical/repo-alpha", "repo-alpha", "Canonical alpha.");
+    // The repository imports a skill with the same name.
+    try fx.writeSkill("repo/repo-alpha", "repo-alpha", "Repo alpha.");
+    var fp: testutil.FakeProvider = .{ .source_tree = try h.srcTree("repo") };
+
+    var c = h.ctx();
+    const res = repository.import(&c, fp.provider(), "https://example.test/skills.git", no_select);
+    const r = switch (res) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+
+    // The import succeeded despite the canonical collision.
+    try testing.expect(r == .imported);
+    try testing.expectEqualStrings("repo-alpha", r.imported.skill_name);
+    try testing.expect(h.importsExists("repo-alpha/SKILL.md"));
+    // The imported draft body is the REPO copy.
+    const imported = try h.readImports("repo-alpha/SKILL.md");
+    try testing.expect(std.mem.indexOf(u8, imported, "Repo alpha.") != null);
+    // The canonical copy is untouched.
+    const canonical = try h.roots.dir().readFileAlloc(io, "canonical/repo-alpha/SKILL.md", h.arena(), .unlimited);
+    try testing.expect(std.mem.indexOf(u8, canonical, "Canonical alpha.") != null);
+}
+
+// --- batch path: a colliding canonical skill is allowed as a replacement draft
+// (spec "Collision Rules" > "Repository batch import": "Allow canonical
+// collisions as replacement drafts"). ---
+
+test "repository import: batch allows a canonical collision as a replacement draft" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    try fx.writeSkill("canonical/repo-beta", "repo-beta", "Canonical beta.");
+    try fx.writeSkill("repo/repo-alpha", "repo-alpha", "First.");
+    try fx.writeSkill("repo/repo-beta", "repo-beta", "Repo beta.");
+    var fp: testutil.FakeProvider = .{ .source_tree = try h.srcTree("repo") };
+
+    var c = h.ctx();
+    const sel: []const []const u8 = &.{ "repo-alpha", "repo-beta" };
+    const res = repository.import(&c, fp.provider(), "https://example.test/skills.git", sel);
+    const r = switch (res) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+    try testing.expect(r == .imported_batch);
+    try testing.expectEqual(@as(usize, 2), r.imported_batch.imports.len);
+    try testing.expect(h.importsExists("repo-alpha/import.json"));
+    try testing.expect(h.importsExists("repo-beta/import.json"));
+}
+
 fn gitAvailable() bool {
     const res = std.process.run(testing.allocator, io, .{
         .argv = &.{ "git", "--version" },
