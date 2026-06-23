@@ -219,6 +219,100 @@ test "imported promoted repository skill carries source_repository and group" {
     , json);
 }
 
+// --- H1(b): an agent_only skill (a real directory in an agent root with no
+// SKILL.md metadata) has NO description, so the inventory must OMIT the
+// `description` key entirely (not emit it as null). This also locks that
+// `source_repository` is omitted for a non-repository skill. Exact-string
+// golden => any omit-vs-null drift breaks this. ---
+test "agent_only skill omits description and source_repository keys (not null)" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    // A bare directory in the codex agent root, with no canonical/imported
+    // backing and no parsable SKILL.md metadata => agent_only, no description.
+    try fx.realDir(.codex, "ghost-skill");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inv = try discover(&roots, arena);
+    const json = try renderJson(inv, arena);
+
+    try testing.expectEqualStrings(
+        \\{
+        \\  "skills": [
+        \\    {
+        \\      "name": "ghost-skill",
+        \\      "source": "agent_only",
+        \\      "promoted": false,
+        \\      "enablement": {
+        \\        "claude_code": false,
+        \\        "codex": true
+        \\      },
+        \\      "agent_entries": {
+        \\        "claude_code": "missing",
+        \\        "codex": "skill_directory"
+        \\      }
+        \\    }
+        \\  ],
+        \\  "source_repositories": []
+        \\}
+        \\
+    , json);
+    // Belt-and-suspenders: no null tokens anywhere (description/source_repository
+    // must be OMITTED, not emitted as null).
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"description\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"source_repository\"") == null);
+}
+
+// --- H1(b): a skill enabled in BOTH agents renders enablement {true,true} with
+// both agent_entries non-missing. Locks that the two enablement booleans and the
+// two agent_entries are independent and both populated. Single trailing newline
+// (spec "Output Contract"). ---
+test "skill enabled in both agents renders enablement true,true with both entries present" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    try fx.writeSkill("canonical/dual-skill", "dual-skill", "Enabled in both agents.");
+    try fx.managedSymlink(.claude, "dual-skill", .canonical, "dual-skill");
+    try fx.managedSymlink(.codex, "dual-skill", .canonical, "dual-skill");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inv = try discover(&roots, arena);
+    const json = try renderJson(inv, arena);
+
+    try testing.expectEqualStrings(
+        \\{
+        \\  "skills": [
+        \\    {
+        \\      "name": "dual-skill",
+        \\      "description": "Enabled in both agents.",
+        \\      "source": "canonical",
+        \\      "promoted": false,
+        \\      "enablement": {
+        \\        "claude_code": true,
+        \\        "codex": true
+        \\      },
+        \\      "agent_entries": {
+        \\        "claude_code": "canonical_symlink",
+        \\        "codex": "canonical_symlink"
+        \\      }
+        \\    }
+        \\  ],
+        \\  "source_repositories": []
+        \\}
+        \\
+    , json);
+    // Exactly one trailing newline.
+    try testing.expect(json[json.len - 1] == '\n');
+    try testing.expect(json[json.len - 2] != '\n');
+}
+
 /// Discover, expecting an error of the given kind (spec discovery failures).
 fn expectDiscoverError(roots: *testutil.TmpRoots, arena: std.mem.Allocator, kind: @import("result.zig").ErrorKind) !void {
     var res = discovery.discover(arena, io, rootsOf(roots));

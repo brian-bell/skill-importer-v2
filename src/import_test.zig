@@ -441,6 +441,99 @@ test "import result renders the spec JSON shape with a trailing newline" {
     try testing.expect(json[json.len - 2] != '\n');
 }
 
+/// Render an import result to its JSON string (owned by `arena`).
+fn renderImportJson(h: *Harness, r: types.ImportResult) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(h.arena());
+    try json_out.writeImportResult(&aw.writer, r);
+    return aw.toOwnedSlice();
+}
+
+/// Byte offset of the n-th (0-based) occurrence of `needle` in `hay`, or null.
+fn nthIndex(hay: []const u8, needle: []const u8, n: usize) ?usize {
+    var start: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, start, needle)) |i| {
+        if (seen == n) return i;
+        seen += 1;
+        start = i + needle.len;
+    }
+    return null;
+}
+
+// --- H1(c): markdown import result WIRE shape. Locks that the `actions` array is
+// rendered in spec order (create_directory < write_skill < write_manifest) on
+// the wire, that the manifest OMITS `source_repository` for a markdown import
+// (not null), and that there is exactly one trailing newline. ---
+test "import result wire: markdown action order and source_repository omitted" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var c = h.ctx();
+
+    const r = switch (importmod.markdown(&c, valid_md, "clipboard")) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+    const json = try renderImportJson(&h, r);
+
+    // Action order on the wire: create_directory, write_skill, write_manifest.
+    const i_create = std.mem.indexOf(u8, json, "\"action\": \"create_directory\"").?;
+    const i_write_skill = std.mem.indexOf(u8, json, "\"action\": \"write_skill\"").?;
+    const i_write_manifest = std.mem.indexOf(u8, json, "\"action\": \"write_manifest\"").?;
+    try testing.expect(i_create < i_write_skill);
+    try testing.expect(i_write_skill < i_write_manifest);
+
+    // source_repository OMITTED (not null) for a markdown import; source_type
+    // markdown; source_location present.
+    try testing.expect(std.mem.indexOf(u8, json, "\"source_repository\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"source_type\": \"markdown\"") != null);
+
+    // Exactly one trailing newline (spec "Output Contract").
+    try testing.expect(json[json.len - 1] == '\n');
+    try testing.expect(json[json.len - 2] != '\n');
+}
+
+// --- H1(c): directory import result WIRE shape. A directory import copies
+// supporting files, so the action array is create_directory, copy_file*,
+// write_manifest. Locks that EVERY copy_file falls between create_directory and
+// write_manifest on the wire, and that source_repository is omitted for a
+// local_path import. ---
+test "import result wire: directory copy_file actions ordered between create_directory and write_manifest" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+    try fx.writeSkill("src/alpha", "alpha", "Alpha dir skill.");
+    try fx.writeSupportFile("src/alpha", "helper.txt", "support data");
+    try fx.writeSupportFile("src/alpha/nested", "deep.txt", "deep data");
+    const src_dir = try std.fs.path.join(h.arena(), &.{ h.roots.base, "src", "alpha" });
+
+    var c = h.ctx();
+    const r = switch (importmod.path(&c, src_dir)) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+    const json = try renderImportJson(&h, r);
+
+    const i_create = std.mem.indexOf(u8, json, "\"action\": \"create_directory\"").?;
+    const i_write_manifest = std.mem.indexOf(u8, json, "\"action\": \"write_manifest\"").?;
+    try testing.expect(i_create < i_write_manifest);
+
+    // At least one copy_file, and every copy_file is between create_directory and
+    // write_manifest.
+    const first_copy = std.mem.indexOf(u8, json, "\"action\": \"copy_file\"");
+    try testing.expect(first_copy != null);
+    var idx: usize = 0;
+    while (nthIndex(json, "\"action\": \"copy_file\"", idx)) |pos| : (idx += 1) {
+        try testing.expect(i_create < pos);
+        try testing.expect(pos < i_write_manifest);
+    }
+
+    // local_path import => source_repository omitted (not null).
+    try testing.expect(std.mem.indexOf(u8, json, "\"source_type\": \"local_path\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"source_repository\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+}
+
 // --- the imported_at persisted in import.json equals the imported_at in the
 // returned result (spec "Import Manifest": imported_at; "JSON Schemas > Import
 // Result": the same manifest object). The clock advances on every call, so a

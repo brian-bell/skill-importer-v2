@@ -239,6 +239,109 @@ test "SkillOperationResult: collection action omits agent (spec: agent omitted f
     try testing.expect(std.mem.indexOf(u8, json, "\"action\": \"remove_directory\"") != null);
 }
 
+test "SkillOperationResult: enable skip_unchanged EMITS target when entry present (spec: target present for agent-involving skip)" {
+    // spec "Skill Operation Result": "`target` is present for symlink actions and
+    // skip actions involving an agent entry." An enable that finds the already-
+    // correct managed symlink emits skip_unchanged WITH the symlink target. The
+    // `target` key MUST be present (not omitted). Locks key order action < agent
+    // < path < target and exactly one trailing newline.
+    const r: types.SkillOperationResult = .{
+        .skill_name = "example-skill",
+        .actions = &.{.{
+            .action = .skip_unchanged,
+            .agent = .claude_code,
+            .path = "/abs/.claude/skills/example-skill",
+            .target = "/abs/agent-skills/third-party/example-skill",
+        }},
+    };
+    const json = try renderOpResult(r);
+    defer testing.allocator.free(json);
+
+    const i_action = std.mem.indexOf(u8, json, "\"action\"").?;
+    const i_agent = std.mem.indexOf(u8, json, "\"agent\"").?;
+    const i_path = std.mem.indexOf(u8, json, "\"path\"").?;
+    const i_target = std.mem.indexOf(u8, json, "\"target\"").?;
+    try testing.expect(i_action < i_agent);
+    try testing.expect(i_agent < i_path);
+    try testing.expect(i_path < i_target);
+    try testing.expect(std.mem.indexOf(u8, json, "\"action\": \"skip_unchanged\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"target\": \"/abs/agent-skills/third-party/example-skill\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"source\"") == null);
+    try testing.expect(json[json.len - 1] == '\n');
+    try testing.expect(json[json.len - 2] != '\n');
+}
+
+test "SkillOperationResult: remove_symlink omits target (spec: target omitted otherwise)" {
+    // spec "Skill Operation Result": `target` is present for symlink actions and
+    // agent-involving skip actions, and OMITTED otherwise. A disable remove of a
+    // managed symlink reports the agent + path but no target => the `target` key
+    // must be OMITTED (not null).
+    const r: types.SkillOperationResult = .{
+        .skill_name = "example-skill",
+        .actions = &.{.{
+            .action = .remove_symlink,
+            .agent = .codex,
+            .path = "/abs/.agents/skills/example-skill",
+            .target = null,
+        }},
+    };
+    const json = try renderOpResult(r);
+    defer testing.allocator.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"action\": \"remove_symlink\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"agent\": \"codex\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"target\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"source\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+}
+
+test "SkillOperationResult: multi-action exact golden (mixed agent/collection, target present/omitted, one trailing newline)" {
+    // Full exact-string golden over a promote-shaped result mixing a collection
+    // action (copy_file, no agent, no target) with an agent action (create_symlink
+    // with agent + target). Locks per-action key order action,agent,path,target,
+    // omit-vs-null for agent/target, the skill_name-first envelope order, and the
+    // single trailing newline (spec "Skill Operation Result" + "Output Contract").
+    const r: types.SkillOperationResult = .{
+        .skill_name = "example-skill",
+        .actions = &.{
+            .{
+                .action = .copy_file,
+                .agent = null,
+                .path = "/abs/canonical/example-skill/SKILL.md",
+                .target = null,
+            },
+            .{
+                .action = .create_symlink,
+                .agent = .codex,
+                .path = "/abs/.agents/skills/example-skill",
+                .target = "/abs/canonical/example-skill",
+            },
+        },
+    };
+    const json = try renderOpResult(r);
+    defer testing.allocator.free(json);
+
+    try testing.expectEqualStrings(
+        \\{
+        \\  "skill_name": "example-skill",
+        \\  "actions": [
+        \\    {
+        \\      "action": "copy_file",
+        \\      "path": "/abs/canonical/example-skill/SKILL.md"
+        \\    },
+        \\    {
+        \\      "action": "create_symlink",
+        \\      "agent": "codex",
+        \\      "path": "/abs/.agents/skills/example-skill",
+        \\      "target": "/abs/canonical/example-skill"
+        \\    }
+        \\  ]
+        \\}
+        \\
+    , json);
+}
+
 test "SkillOperationResult: disable skip_unchanged omits target when missing-entry (spec: target absent)" {
     // spec "Skill Operation Result": "`target` is present for symlink actions and
     // skip actions involving an agent entry." A disable skip for a MISSING entry

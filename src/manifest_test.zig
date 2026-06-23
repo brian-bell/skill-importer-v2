@@ -60,6 +60,117 @@ test "write: emits source_repository for repository imports" {
     try testing.expect(std.mem.indexOf(u8, bytes, "\"skill_path\": \"alpha\"") != null);
 }
 
+// --- H1(a): exact on-the-wire golden for the FULL repository manifest. Locks
+// the complete top-level field order (source_type, source_location?,
+// source_repository?, imported_at, content_hash, promoted), the NESTED
+// source_repository order (repository BEFORE skill_path), imported_at as an
+// UNQUOTED JSON number, and NO trailing newline. A reorder, an omit-vs-null
+// drift, or a quoted imported_at all break this exact-string match. ---
+test "write: repository manifest exact golden (field order, nested order, no trailing newline)" {
+    const m: types.ImportManifest = .{
+        .source_type = .repository,
+        .source_location = "https://example.test/skills.git#helpers/example-skill",
+        .source_repository = .{
+            .repository = "https://example.test/skills.git",
+            .skill_path = "helpers/example-skill",
+        },
+        .imported_at = 1710000000,
+        .content_hash = "sha256:deadbeef",
+        .promoted = false,
+    };
+    const bytes = try manifest.toBytes(testing.allocator, m);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqualStrings(
+        \\{
+        \\  "source_type": "repository",
+        \\  "source_location": "https://example.test/skills.git#helpers/example-skill",
+        \\  "source_repository": {
+        \\    "repository": "https://example.test/skills.git",
+        \\    "skill_path": "helpers/example-skill"
+        \\  },
+        \\  "imported_at": 1710000000,
+        \\  "content_hash": "sha256:deadbeef",
+        \\  "promoted": false
+        \\}
+    , bytes);
+    // No trailing newline on disk.
+    try testing.expect(bytes[bytes.len - 1] == '}');
+}
+
+// --- H1(a): exact on-the-wire golden for a NON-repository manifest. Locks that
+// `source_location` is PRESENT (it has a value here) while `source_repository`
+// is OMITTED (not null), that imported_at is an unquoted number, and that there
+// is no trailing newline. ---
+test "write: non-repository manifest exact golden (source_repository omitted, no trailing newline)" {
+    const m: types.ImportManifest = .{
+        .source_type = .markdown,
+        .source_location = "clipboard",
+        .imported_at = 1710000000,
+        .content_hash = "sha256:abc",
+        .promoted = false,
+    };
+    const bytes = try manifest.toBytes(testing.allocator, m);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqualStrings(
+        \\{
+        \\  "source_type": "markdown",
+        \\  "source_location": "clipboard",
+        \\  "imported_at": 1710000000,
+        \\  "content_hash": "sha256:abc",
+        \\  "promoted": false
+        \\}
+    , bytes);
+    // No trailing newline (the golden above intentionally has none).
+    try testing.expect(bytes[bytes.len - 1] == '}');
+}
+
+// --- H1(a): a manifest with NO source_location AND no source_repository must
+// OMIT both optional keys (not emit them as null), preserving field order
+// source_type -> imported_at. ---
+test "write: manifest omits both source_location and source_repository when absent" {
+    const m: types.ImportManifest = .{
+        .source_type = .markdown,
+        .source_location = null,
+        .source_repository = null,
+        .imported_at = 1710000000,
+        .content_hash = "sha256:abc",
+        .promoted = false,
+    };
+    const bytes = try manifest.toBytes(testing.allocator, m);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqualStrings(
+        \\{
+        \\  "source_type": "markdown",
+        \\  "imported_at": 1710000000,
+        \\  "content_hash": "sha256:abc",
+        \\  "promoted": false
+        \\}
+    , bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "null") == null);
+}
+
+// --- H1(a): imported_at must serialize as an UNQUOTED JSON number, never a
+// quoted string. A regression that wraps the timestamp in quotes (or emits it
+// as a string) fails here. ---
+test "write: imported_at is an unquoted JSON number" {
+    const m: types.ImportManifest = .{
+        .source_type = .markdown,
+        .source_location = "clipboard",
+        .imported_at = 1710000000,
+        .content_hash = "sha256:abc",
+        .promoted = false,
+    };
+    const bytes = try manifest.toBytes(testing.allocator, m);
+    defer testing.allocator.free(bytes);
+
+    // Unquoted number present; quoted variant absent.
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"imported_at\": 1710000000") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"imported_at\": \"1710000000\"") == null);
+}
+
 // spec "Import Manifest": read with ignore_unknown_fields; round-trip preserves
 // fields, including an omitted optional source_repository.
 test "round-trip: optional source_repository omitted" {
