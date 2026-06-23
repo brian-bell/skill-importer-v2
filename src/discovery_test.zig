@@ -679,3 +679,237 @@ test "source_repositories groups by repo and sorts by (skill_name, skill_path)" 
     try testing.expectEqualStrings("zeta", b_group.skills[1].skill_name);
     try testing.expectEqualStrings("z", b_group.skills[1].skill_path);
 }
+
+// ===========================================================================
+// H3 — manifest/discovery malformed + edge cases.
+// ===========================================================================
+
+// --- H3(1): an import.json that is syntactically-VALID JSON but SEMANTICALLY
+// malformed because a REQUIRED field is missing (spec "Import Manifest" required
+// fields: source_type, imported_at, content_hash, promoted) must FAIL discovery
+// for an otherwise-valid imported skill (spec "list": "malformed import.json ...
+// is an error"). manifest_test covers this at the parse layer; this locks it
+// end-to-end through discover() and that the error names the skill + import.json
+// path. A regression that lets a missing required field slip through (e.g. by
+// adding a default to ImportManifest) would turn this into a silent success. ---
+test "H3: semantically-malformed import.json (missing required field) fails discovery" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    try fx.writeSkill("imports/missing-field", "missing-field", "Valid skill, bad manifest.");
+    // Syntactically valid JSON, but `content_hash` and `promoted` are absent.
+    try fx.writeRawManifest("imports/missing-field",
+        \\{
+        \\  "source_type": "markdown",
+        \\  "source_location": "clipboard",
+        \\  "imported_at": 1710000000
+        \\}
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var res = discovery.discover(arena, io, rootsOf(&roots));
+    switch (res) {
+        .ok => return error.UnexpectedSuccess,
+        .err => |*e| {
+            defer e.deinit(arena);
+            try testing.expectEqual(@import("result.zig").ErrorKind.malformed_manifest, e.kind);
+            // The error must name the offending skill and its import.json path
+            // (spec "Output Contract": include the specific path/skill name).
+            try testing.expect(e.name != null);
+            try testing.expectEqualStrings("missing-field", e.name.?);
+            try testing.expect(e.path != null);
+            try testing.expect(std.mem.endsWith(u8, e.path.?, "import.json"));
+        },
+    }
+}
+
+// --- H3(1): an import.json whose `source_type` carries an UNKNOWN/invalid enum
+// value (spec "Import Manifest": source_type is the closed set {markdown,
+// local_path, url, repository}) is semantically malformed and must FAIL
+// discovery, even though the JSON is otherwise well-formed and ignore_unknown_
+// fields is on. ignore_unknown_fields governs unknown KEYS, never an invalid
+// enum VALUE for a known key; a regression that mapped bad enums leniently would
+// turn this into a silent success. ---
+test "H3: import.json with invalid source_type enum value fails discovery" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    try fx.writeSkill("imports/bad-enum", "bad-enum", "Valid skill, bad enum.");
+    try fx.writeRawManifest("imports/bad-enum",
+        \\{
+        \\  "source_type": "ftp",
+        \\  "source_location": "ftp://example.test/x.md",
+        \\  "imported_at": 1710000000,
+        \\  "content_hash": "sha256:x",
+        \\  "promoted": false
+        \\}
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try expectDiscoverError(&roots, arena, .malformed_manifest);
+}
+
+// --- H3(2): a directory under canonical/ with a PRESENT-but-INVALID SKILL.md
+// (here: missing the closing `---` delimiter, spec "Skill Metadata" validation
+// failure) is NOT a recognized skill and is EXCLUDED from discovery WITHOUT
+// erroring (spec "list": skills are identified by VALID SKILL.md metadata;
+// readSkill returns null for invalid frontmatter). A regression that errored on
+// an invalid SKILL.md, or that admitted the directory as a skill, breaks this. ---
+test "H3: invalid SKILL.md under canonical is excluded without erroring" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    // A real canonical skill (so the inventory is non-empty and we prove the
+    // BAD one was dropped, not that discovery short-circuited).
+    try fx.writeSkill("canonical/good", "good", "A valid canonical skill.");
+    // A directory with a SKILL.md that has an opening but no closing delimiter.
+    try fx.writeSupportFile("canonical/broken", "SKILL.md", "---\nname: broken\ndescription: no close\n");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inv = try discover(&roots, arena);
+    try testing.expectEqual(@as(usize, 1), inv.skills.len);
+    try testing.expectEqualStrings("good", inv.skills[0].name);
+    try testing.expectEqual(types.SkillSource.canonical, inv.skills[0].source);
+}
+
+// --- H3(2): a directory under imports/ with a PRESENT-but-INVALID SKILL.md
+// (here: missing the `description` field, spec "Skill Metadata": description must
+// be present) is EXCLUDED from discovery WITHOUT erroring, and crucially WITHOUT
+// reaching the import.json malformed-manifest check (a non-skill directory is
+// skipped before its manifest is even read). ---
+test "H3: invalid SKILL.md under imports is excluded without erroring" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    try fx.writeSkill("imports/real", "real", "A valid imported skill.");
+    // Invalid SKILL.md (no description) AND a malformed import.json: since the
+    // directory is not a recognized skill, discovery must skip it ENTIRELY and
+    // never reach the manifest, so this must NOT raise malformed_manifest.
+    try fx.writeSupportFile("imports/invalid", "SKILL.md", "---\nname: invalid\n---\n");
+    try fx.writeRawManifest("imports/invalid", "{ not even json ");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inv = try discover(&roots, arena);
+    try testing.expectEqual(@as(usize, 1), inv.skills.len);
+    try testing.expectEqualStrings("real", inv.skills[0].name);
+    try testing.expectEqual(types.SkillSource.imported, inv.skills[0].source);
+}
+
+// --- H3(3): a stray regular file in an agent root is NOT a managed skill and
+// produces NO inventory entry (discovery.classifyAgentEntry returns null for a
+// non-directory/non-symlink entry). Only the real skill remains. ---
+test "H3: stray regular file in an agent root produces no inventory entry" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    try fx.writeSkill("canonical/keeper", "keeper", "Kept.");
+    try fx.managedSymlink(.claude, "keeper", .canonical, "keeper");
+    // A stray regular file directly in an agent root (e.g. a README or .DS_Store).
+    try fx.strayFile(.claude, "README.md", "not a skill");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inv = try discover(&roots, arena);
+    try testing.expectEqual(@as(usize, 1), inv.skills.len);
+    try testing.expectEqualStrings("keeper", inv.skills[0].name);
+    // The stray file did not become a phantom skill.
+    for (inv.skills) |s| try testing.expect(!std.mem.eql(u8, s.name, "README.md"));
+}
+
+// --- H3(3): an imports/ directory that contains import.json but NO SKILL.md is
+// not a recognized skill (spec "Terms": a skill is a directory containing
+// SKILL.md) and is SKIPPED with no inventory entry. The orphan import.json must
+// NOT trigger a malformed_manifest error either: readSkill returns null first,
+// so the manifest is never consulted. ---
+test "H3: imports dir with import.json but no SKILL.md is skipped" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    try fx.writeSkill("imports/real", "real", "Has SKILL.md.");
+    // An orphan directory: import.json present, SKILL.md absent.
+    try fx.writeManifest("imports/orphan", .{
+        .source_type = .markdown,
+        .imported_at = 1710000000,
+        .content_hash = "sha256:orphan",
+        .promoted = false,
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inv = try discover(&roots, arena);
+    try testing.expectEqual(@as(usize, 1), inv.skills.len);
+    try testing.expectEqualStrings("real", inv.skills[0].name);
+}
+
+// --- H3(4): a CANONICAL skill that ALSO has an agent-root entry keeps
+// source == canonical (the agent scan must NOT downgrade an established
+// canonical/imported source to agent_only). The agent entry is still classified
+// and enablement reflects it. Regression: scanAgent's getOrPut must reuse the
+// existing Merged (source already canonical) and only set the agent status. ---
+test "H3: canonical skill with an agent entry keeps source canonical" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    try fx.writeSkill("canonical/example-skill", "example-skill", "Canonical with agent entry.");
+    // A real directory (not a managed symlink) in the agent root, same name.
+    try fx.realDir(.codex, "example-skill");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inv = try discover(&roots, arena);
+    try testing.expectEqual(@as(usize, 1), inv.skills.len);
+    const s = inv.skills[0];
+    // Source stays canonical even though an agent-root entry exists.
+    try testing.expectEqual(types.SkillSource.canonical, s.source);
+    try testing.expectEqual(types.AgentEntryStatus.skill_directory, s.agent_entries.codex);
+    try testing.expect(s.enablement.codex);
+    // The canonical description survives.
+    try testing.expectEqualStrings("Canonical with agent entry.", s.description.?);
+}
+
+// --- H3(5): one skill with DIFFERENT statuses in the two agents in a single
+// inventory: claude_code is a managed canonical_symlink (enabled), codex is a
+// broken_symlink (disabled). Locks that the two agent_entries and the two
+// enablement booleans are independently populated for the SAME skill from the
+// SAME inventory pass (spec "Inventory": agent_entries/enablement keys). ---
+test "H3: same skill carries distinct claude_code and codex statuses" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    try fx.writeSkill("canonical/split-skill", "split-skill", "Different per agent.");
+    // claude: correct managed canonical symlink -> canonical_symlink, enabled.
+    try fx.managedSymlink(.claude, "split-skill", .canonical, "split-skill");
+    // codex: a broken symlink (target does not exist) -> broken_symlink, disabled.
+    try fx.symlink("nowhere/split-skill", "codex/split-skill");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inv = try discover(&roots, arena);
+    try testing.expectEqual(@as(usize, 1), inv.skills.len);
+    const s = inv.skills[0];
+    try testing.expectEqual(types.SkillSource.canonical, s.source);
+    try testing.expectEqual(types.AgentEntryStatus.canonical_symlink, s.agent_entries.claude_code);
+    try testing.expectEqual(types.AgentEntryStatus.broken_symlink, s.agent_entries.codex);
+    try testing.expect(s.enablement.claude_code);
+    try testing.expect(!s.enablement.codex);
+}
