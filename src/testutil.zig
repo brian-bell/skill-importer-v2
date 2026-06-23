@@ -8,6 +8,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const result = @import("result.zig");
+const net = @import("net.zig");
 
 const io = std.testing.io;
 
@@ -214,22 +215,10 @@ pub const FixedClock = struct {
     }
 };
 
-/// Network fetcher abstraction (struct of fn pointers) so URL import tests are
-/// hermetic (zig-clean-room-cli.md: fake net provider). The real implementation
-/// (net.zig, Phase 4a) supplies the same interface backed by std.http.
-pub const Fetcher = struct {
-    /// Fetch the body at `url` into freshly allocated bytes owned by the caller,
-    /// or return a `result.ErrorKind` (fetch_failed/size_exceeded/invalid_utf8/
-    /// timeout) per spec "import url".
-    fetchFn: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, url: []const u8) FetchError![]u8,
-    ctx: *anyopaque,
-
-    pub const FetchError = error{ FetchFailed, SizeExceeded, InvalidUtf8, Timeout, OutOfMemory };
-
-    pub fn fetch(self: Fetcher, gpa: std.mem.Allocator, url: []const u8) FetchError![]u8 {
-        return self.fetchFn(self.ctx, gpa, url);
-    }
-};
+/// Network fetcher abstraction. The canonical interface lives in net.zig so the
+/// real (std.http-backed) and fake fetchers share one type; re-exported here for
+/// test convenience (zig-clean-room-cli.md: fake net provider).
+pub const Fetcher = net.Fetcher;
 
 /// A fake fetcher returning canned bytes or a canned error.
 pub const FakeFetcher = struct {
