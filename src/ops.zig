@@ -838,10 +838,25 @@ fn frontmatterCollisionElsewhere(c: *Context, skill_name: []const u8) anyerror!r
     };
     defer dir.close(c.io);
 
+    // The promote stage-then-swap uses reserved sibling temp directories
+    // `.<name>.staging` / `.<name>.old` (executePromote). A crash-interrupted run
+    // can leave a `.<name>.staging` dir behind containing a valid SKILL.md whose
+    // frontmatter name == `skill_name`. That reserved path is the operation's OWN
+    // transient directory, not a colliding canonical skill, so it must be excluded
+    // from the collision scan (Finding #11) — otherwise the leftover would raise a
+    // false frontmatter_name_collision and permanently block re-promotion. Genuine
+    // collisions (any other directory) are still detected.
+    const staging_name = try std.fmt.allocPrint(c.arena, ".{s}.staging", .{skill_name});
+    const backup_name = try std.fmt.allocPrint(c.arena, ".{s}.old", .{skill_name});
+
     var it = dir.iterate();
     while (try it.next(c.io)) |entry| {
         if (entry.kind != .directory) continue;
         if (std.mem.eql(u8, entry.name, skill_name)) continue; // overwrite target
+        // Reserved promote temporaries for THIS skill: ignore (Finding #11). The
+        // execute phase cleans any stale staging dir before re-staging.
+        if (std.mem.eql(u8, entry.name, staging_name) or
+            std.mem.eql(u8, entry.name, backup_name)) continue;
         const sub_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, entry.name });
         const existing = (try frontmatterNameOf(c, sub_dir)) orelse continue;
         if (std.mem.eql(u8, existing, skill_name)) {

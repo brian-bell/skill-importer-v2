@@ -360,6 +360,54 @@ test "promote: frontmatter-name collision elsewhere in canonical fails (spec pro
     try expectErrKind(ops.promote(&c, "delta", false), .frontmatter_name_collision);
 }
 
+// --- leftover staging from a crash-interrupted promote (Finding #11) -------
+
+test "promote: a leftover .<name>.staging dir from an interrupted promote does NOT cause a false frontmatter_name_collision (Finding #11)" {
+    // A crash-interrupted promote can leave `<canonical>/.<name>.staging`
+    // containing a valid SKILL.md whose frontmatter name == <name>. The reserved
+    // staging path is the operation's OWN transient directory and must not be
+    // treated as a colliding canonical skill (spec "Collision Rules": frontmatter
+    // collisions are about real canonical skills). Re-running promote must succeed
+    // and clean the stale staging dir, not be permanently blocked.
+    var h = try Harness.init();
+    defer h.deinit();
+    try draft(&h, "omega", "omega", "Omega draft.");
+    // Simulate the crash-leftover: a staging dir with a valid SKILL.md naming the
+    // same skill. Its directory name (.omega.staging) differs from "omega", so the
+    // buggy collision scan flags it as a frontmatter_name_collision.
+    try h.fixtures().writeSkill("canonical/.omega.staging", "omega", "Half-staged omega.");
+    var c = h.ctx();
+
+    const r = try expectOk(ops.promote(&c, "omega", false));
+    try testing.expectEqualStrings("omega", r.skill_name);
+
+    // The canonical copy was created from the real draft content.
+    const skill = try readFile(&h, "canonical/omega/SKILL.md");
+    try testing.expect(std.mem.indexOf(u8, skill, "Omega draft.") != null);
+    // The stale staging dir is gone (no litter remains).
+    try expectNoStagingLitter(&h, "omega");
+    // Draft manifest flipped to promoted.
+    const man = try readManifest(&h, "imports/omega");
+    try testing.expect(man.promoted);
+}
+
+test "promote: a genuine frontmatter name collision in a real canonical dir still fails even with a leftover staging dir present (Finding #11)" {
+    // The staging-exclusion fix must NOT mask a real collision: a DIFFERENT,
+    // real canonical directory whose SKILL.md frontmatter name equals the skill
+    // still collides (spec "Collision Rules"). The presence of a leftover staging
+    // dir for the same skill must not suppress that genuine collision.
+    var h = try Harness.init();
+    defer h.deinit();
+    try draft(&h, "psi-c", "psi-c", "Psi-c draft.");
+    // A real, non-reserved canonical dir colliding on frontmatter name.
+    try h.fixtures().writeSkill("canonical/other-psi", "psi-c", "Other psi-c.");
+    // Plus a leftover staging dir for the skill being promoted.
+    try h.fixtures().writeSkill("canonical/.psi-c.staging", "psi-c", "Half-staged psi-c.");
+    var c = h.ctx();
+
+    try expectErrKind(ops.promote(&c, "psi-c", false), .frontmatter_name_collision);
+}
+
 // --- unsupported entries inside the import dir (symlinks) ------------------
 
 test "promote: symlink inside the import directory fails (spec promote: Unsupported entries ... must fail.)" {
