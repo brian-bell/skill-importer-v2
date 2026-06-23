@@ -72,13 +72,19 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) result.Result(Metadata)
 }
 
 /// True iff `name` is a single directory-safe path segment: non-empty, not `.`
-/// or `..`, and containing no path separators (spec "Terms": Skill name).
+/// or `..`, containing no path separators, and free of NUL / ASCII control
+/// characters (spec "Terms": Skill name must be a directory-safe path segment).
 pub fn validateSkillName(name: []const u8) bool {
     if (name.len == 0) return false;
     if (std.mem.eql(u8, name, ".")) return false;
     if (std.mem.eql(u8, name, "..")) return false;
     // Reject both POSIX and Windows separators so storage is safe on any host.
     if (std.mem.indexOfAny(u8, name, "/\\") != null) return false;
+    // Reject NUL (truncates C path APIs) and all ASCII control characters
+    // (C0 controls 0x00-0x1F and DEL 0x7F); none are directory-safe.
+    for (name) |c| {
+        if (c < 0x20 or c == 0x7f) return false;
+    }
     return true;
 }
 

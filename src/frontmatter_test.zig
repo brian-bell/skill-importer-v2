@@ -171,6 +171,92 @@ test "parse: empty description fails" {
     try testing.expectEqual(result.ErrorKind.missing_description, r.err.kind);
 }
 
+// --- Exact-key matching: prefix / look-alike keys must NOT be read as the real
+// `name`/`description` keys. The match must be on the exact key up to the colon
+// (spec "Skill Metadata": "only needs to recognize `name:` and `description:`
+// lines"). A regression to loose prefix-matching must fail these tests. ---
+
+test "parse: 'username:' is not read as 'name'" {
+    // `username:` shares no real `name` field; the only true name is `real-name`.
+    const src =
+        \\---
+        \\username: imposter
+        \\name: real-name
+        \\description: d
+        \\---
+    ;
+    const r = frontmatter.parse(testing.allocator, src);
+    try testing.expect(r.isOk());
+    try testing.expectEqualStrings("real-name", r.ok.name);
+}
+
+test "parse: 'name_x:' is not read as 'name'" {
+    const src =
+        \\---
+        \\name_x: imposter
+        \\name: real-name
+        \\description: d
+        \\---
+    ;
+    const r = frontmatter.parse(testing.allocator, src);
+    try testing.expect(r.isOk());
+    try testing.expectEqualStrings("real-name", r.ok.name);
+}
+
+test "parse: 'namespace:' is not read as 'name'" {
+    const src =
+        \\---
+        \\namespace: imposter
+        \\name: real-name
+        \\description: d
+        \\---
+    ;
+    const r = frontmatter.parse(testing.allocator, src);
+    try testing.expect(r.isOk());
+    try testing.expectEqualStrings("real-name", r.ok.name);
+}
+
+test "parse: only a look-alike 'name' key means name is missing" {
+    // With no exact `name:` key, the only keys being look-alikes must leave the
+    // name unset, so parsing fails with missing_name rather than borrowing the
+    // imposter's value.
+    const src =
+        \\---
+        \\namespace: imposter
+        \\name_x: also-imposter
+        \\description: d
+        \\---
+    ;
+    const r = frontmatter.parse(testing.allocator, src);
+    try testing.expect(!r.isOk());
+    try testing.expectEqual(result.ErrorKind.missing_name, r.err.kind);
+}
+
+test "parse: 'description_long:' is not read as 'description'" {
+    const src =
+        \\---
+        \\name: has-name
+        \\description_long: imposter
+        \\description: real desc
+        \\---
+    ;
+    const r = frontmatter.parse(testing.allocator, src);
+    try testing.expect(r.isOk());
+    try testing.expectEqualStrings("real desc", r.ok.description);
+}
+
+test "parse: only a look-alike 'description' key means description is missing" {
+    const src =
+        \\---
+        \\name: has-name
+        \\description_long: imposter
+        \\---
+    ;
+    const r = frontmatter.parse(testing.allocator, src);
+    try testing.expect(!r.isOk());
+    try testing.expectEqual(result.ErrorKind.missing_description, r.err.kind);
+}
+
 // --- validateSkillName as a standalone unit (spec "Terms": Skill name rules).
 
 test "validateSkillName: accepts a plain segment" {
@@ -184,4 +270,28 @@ test "validateSkillName: rejects empty, dot, dotdot, separators" {
     try testing.expect(!frontmatter.validateSkillName(".."));
     try testing.expect(!frontmatter.validateSkillName("a/b"));
     try testing.expect(!frontmatter.validateSkillName("a\\b"));
+}
+
+test "validateSkillName: rejects an embedded NUL byte" {
+    // A NUL byte truncates C path APIs and is never directory-safe (spec
+    // "Terms": Skill name must be a directory-safe path segment).
+    try testing.expect(!frontmatter.validateSkillName("foo\x00bar"));
+    try testing.expect(!frontmatter.validateSkillName("\x00"));
+    try testing.expect(!frontmatter.validateSkillName("trailing\x00"));
+}
+
+test "validateSkillName: rejects ASCII control characters" {
+    // Newlines, tabs, CR, ESC, DEL and other C0 controls are not directory-safe.
+    try testing.expect(!frontmatter.validateSkillName("foo\nbar"));
+    try testing.expect(!frontmatter.validateSkillName("foo\tbar"));
+    try testing.expect(!frontmatter.validateSkillName("foo\rbar"));
+    try testing.expect(!frontmatter.validateSkillName("foo\x1bbar")); // ESC
+    try testing.expect(!frontmatter.validateSkillName("foo\x7fbar")); // DEL
+    try testing.expect(!frontmatter.validateSkillName("foo\x01bar")); // SOH
+    try testing.expect(!frontmatter.validateSkillName("\x1fend")); // US
+}
+
+test "validateSkillName: still accepts ordinary printable segments" {
+    try testing.expect(frontmatter.validateSkillName("a b"));
+    try testing.expect(frontmatter.validateSkillName("Skill-123_v2.md"));
 }
