@@ -382,6 +382,28 @@ fn opRun(
     };
 }
 
+/// Build an `io_error` result for an execute-phase failure, carrying the actions
+/// that completed BEFORE the failure in `partial_actions` (spec "Filesystem
+/// Safety": "Partially completed operations caused by unexpected I/O errors
+/// should report the actions that completed before the failure"). The accumulated
+/// `actions` list (arena-backed) is moved into the error payload.
+fn executeError(
+    c: *Context,
+    skill_name: []const u8,
+    err: anyerror,
+    actions: *std.ArrayList(types.SkillAction),
+) Result {
+    if (err == error.OutOfMemory) {
+        return .{ .err = .{ .kind = .io_error, .name = dup(c, skill_name), .reason = "out of memory" } };
+    }
+    return .{ .err = .{
+        .kind = .io_error,
+        .name = dup(c, skill_name),
+        .reason = @errorName(err),
+        .partial_actions = actions.*,
+    } };
+}
+
 // --- promote ---------------------------------------------------------------
 
 /// `promote` (spec): copy an imported draft skill from the imports root into the
@@ -462,11 +484,37 @@ fn promoteRun(c: *Context, skill_name: []const u8, overwrite: bool) anyerror!Res
         }
     }
 
-    // 3. Execute. Stage the new copy in a sibling staging dir on the same mount,
-    //    then swap (spec promote: "the existing canonical copy must not be removed
-    //    until the replacement copy is known to be valid and ready").
+    // 3. Execute. On an execute-phase I/O error, surface the actions that
+    //    completed before the failure (spec "Filesystem Safety": report the
+    //    completed actions).
     var actions: std.ArrayList(types.SkillAction) = .empty;
+    executePromote(c, skill_name, import_dir, dest_dir, dest_exists, relinks.items, &actions) catch |err| {
+        return executeError(c, skill_name, err, &actions);
+    };
 
+    return .{ .ok = .{
+        .skill_name = dup(c, skill_name),
+        .actions = try actions.toOwnedSlice(c.arena),
+    } };
+}
+
+/// Execute phase of promote: stage-then-swap the canonical copy, relink managed
+/// import symlinks, and flip the draft manifest. Appends an action per completed
+/// step into `actions` so a mid-flight failure can report the partial progress.
+fn executePromote(
+    c: *Context,
+    skill_name: []const u8,
+    import_dir: []const u8,
+    dest_dir: []const u8,
+    dest_exists: bool,
+    relinks: []const types.Agent,
+    actions: *std.ArrayList(types.SkillAction),
+) anyerror!void {
+    const cwd = std.Io.Dir.cwd();
+
+    // Stage the new copy in a sibling staging dir on the same mount, then swap
+    // (spec promote: "the existing canonical copy must not be removed until the
+    // replacement copy is known to be valid and ready").
     const canonical_created = (try fsutil.classify(c.io, cwd, c.canonical_root)) == .missing;
     try cwd.createDirPath(c.io, c.canonical_root);
     if (canonical_created) {
@@ -486,7 +534,7 @@ fn promoteRun(c: *Context, skill_name: []const u8, overwrite: bool) anyerror!Res
         // (<canonical>/<name>/...), not the transient staging dir — after the
         // swap the staging path no longer exists (spec promote / Skill Operation
         // Result copy_file 'path' / Filesystem Safety step 5).
-        copyExcludingManifest(c, src, dst, dest_dir, "", &actions) catch |err| {
+        copyExcludingManifest(c, src, dst, dest_dir, "", actions) catch |err| {
             cwd.deleteTree(c.io, staging_dir) catch {};
             return err;
         };
@@ -509,7 +557,7 @@ fn promoteRun(c: *Context, skill_name: []const u8, overwrite: bool) anyerror!Res
     }
 
     // Relink managed import symlinks to the canonical copy (spec promote).
-    for (relinks.items) |agent| {
+    for (relinks) |agent| {
         const link_path = try std.fs.path.join(c.arena, &.{ c.agentRoot(agent), skill_name });
         try cwd.deleteFile(c.io, link_path);
         try actions.append(c.arena, .{ .action = .remove_symlink, .agent = agent, .path = dup(c, link_path) });
@@ -518,12 +566,7 @@ fn promoteRun(c: *Context, skill_name: []const u8, overwrite: bool) anyerror!Res
     }
 
     // Set the draft manifest promoted=true (spec promote).
-    try setManifestPromoted(c, import_dir, true, &actions);
-
-    return .{ .ok = .{
-        .skill_name = dup(c, skill_name),
-        .actions = try actions.toOwnedSlice(c.arena),
-    } };
+    try setManifestPromoted(c, import_dir, true, actions);
 }
 
 /// Preflight one agent entry for promote. Returns ok(true) when the entry is a
@@ -561,8 +604,6 @@ pub fn unpromote(c: *Context, skill_name: []const u8) Result {
 }
 
 fn unpromoteRun(c: *Context, skill_name: []const u8) anyerror!Result {
-    const cwd = std.Io.Dir.cwd();
-
     const entry = switch (resolveEntry(c, skill_name)) {
         .ok => |e| e,
         .err => |e| return .{ .err = e },
@@ -577,9 +618,32 @@ fn unpromoteRun(c: *Context, skill_name: []const u8) anyerror!Result {
 
     const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, skill_name });
     const dest_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, skill_name });
-    const dest_canon = try canonOrLexical(c, dest_dir);
 
+    // Execute; on an execute-phase I/O error report the completed actions (spec
+    // "Filesystem Safety").
     var actions: std.ArrayList(types.SkillAction) = .empty;
+    executeUnpromote(c, skill_name, import_dir, dest_dir, &actions) catch |err| {
+        return executeError(c, skill_name, err, &actions);
+    };
+
+    return .{ .ok = .{
+        .skill_name = dup(c, skill_name),
+        .actions = try actions.toOwnedSlice(c.arena),
+    } };
+}
+
+/// Execute phase of unpromote: remove managed agent symlinks to the canonical
+/// copy, remove the canonical copy, and flip the draft manifest. Appends an
+/// action per completed step for partial-failure reporting.
+fn executeUnpromote(
+    c: *Context,
+    skill_name: []const u8,
+    import_dir: []const u8,
+    dest_dir: []const u8,
+    actions: *std.ArrayList(types.SkillAction),
+) anyerror!void {
+    const cwd = std.Io.Dir.cwd();
+    const dest_canon = try canonOrLexical(c, dest_dir);
 
     // Remove managed agent symlinks pointing at the canonical copy (spec
     // unpromote). Any OTHER agent entry (external/broken/real) is left untouched
@@ -600,12 +664,7 @@ fn unpromoteRun(c: *Context, skill_name: []const u8) anyerror!Result {
     }
 
     // Mark the draft manifest promoted=false (spec unpromote).
-    try setManifestPromoted(c, import_dir, false, &actions);
-
-    return .{ .ok = .{
-        .skill_name = dup(c, skill_name),
-        .actions = try actions.toOwnedSlice(c.arena),
-    } };
+    try setManifestPromoted(c, import_dir, false, actions);
 }
 
 // --- delete ----------------------------------------------------------------
@@ -618,8 +677,6 @@ pub fn delete(c: *Context, skill_name: []const u8) Result {
 }
 
 fn deleteRun(c: *Context, skill_name: []const u8) anyerror!Result {
-    const cwd = std.Io.Dir.cwd();
-
     const entry = switch (resolveEntry(c, skill_name)) {
         .ok => |e| e,
         .err => |e| return .{ .err = e },
@@ -646,14 +703,25 @@ fn deleteRun(c: *Context, skill_name: []const u8) anyerror!Result {
 
     const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, skill_name });
 
+    // Execute; on an execute-phase I/O error report whatever completed (spec
+    // "Filesystem Safety"). The single remove_directory action is appended only
+    // after it succeeds, so a failed deleteTree reports no partial action.
     var actions: std.ArrayList(types.SkillAction) = .empty;
-    try cwd.deleteTree(c.io, import_dir);
-    try actions.append(c.arena, .{ .action = .remove_directory, .path = import_dir });
+    executeDelete(c, import_dir, &actions) catch |err| {
+        return executeError(c, skill_name, err, &actions);
+    };
 
     return .{ .ok = .{
         .skill_name = dup(c, skill_name),
         .actions = try actions.toOwnedSlice(c.arena),
     } };
+}
+
+/// Execute phase of delete: remove the imports-root draft directory.
+fn executeDelete(c: *Context, import_dir: []const u8, actions: *std.ArrayList(types.SkillAction)) anyerror!void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.deleteTree(c.io, import_dir);
+    try actions.append(c.arena, .{ .action = .remove_directory, .path = import_dir });
 }
 
 // --- promote/unpromote/delete helpers --------------------------------------
