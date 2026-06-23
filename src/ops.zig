@@ -234,6 +234,14 @@ fn preflight(
                 .needs_root = false,
             } },
             .symlink => {
+                // A BROKEN symlink (target does not resolve) is an unsafe External
+                // entry and must be left untouched, NOT removed (spec "disable":
+                // "Unsafe entries are rejected and left untouched"; spec "Terms":
+                // a broken symlink is an External entry). This is checked BEFORE
+                // the lexical pointing-at tests because a broken managed symlink
+                // still matches `canonical_target`/`imports_target` lexically — the
+                // bug that would remove a dangling managed link (Finding #8).
+                if (!try symlinkResolves(c, link_path)) return unsafe(c, link_path, agent);
                 // A managed symlink for THIS skill (pointing at the canonical copy
                 // or the draft import dir for a legacy-enabled unpromoted import)
                 // is removed; anything else is unsafe (spec "disable").
@@ -354,6 +362,17 @@ fn symlinkPointsAt(c: *Context, link_path: []const u8, expected_target: []const 
 fn canonOrLexical(c: *Context, path: []const u8) ![]const u8 {
     return fsutil.canonicalizeExistingAncestor(c.arena, c.io, path) catch
         std.fs.path.resolve(c.arena, &.{path});
+}
+
+/// True iff the symlink at `link_path` RESOLVES end-to-end (its target is
+/// reachable). Mirrors discovery's broken-symlink probe: only a successful
+/// follow-stat means the target resolves; ANY error (FileNotFound, SymLinkLoop,
+/// AccessDenied through the chain, ...) means the link is broken. Used by disable
+/// to reject a broken managed symlink as unsafe instead of removing it
+/// (spec "disable"/"Terms"; Finding #8).
+fn symlinkResolves(c: *Context, link_path: []const u8) !bool {
+    _ = std.Io.Dir.cwd().statFile(c.io, link_path, .{ .follow_symlinks = true }) catch return false;
+    return true;
 }
 
 fn dup(c: *Context, s: []const u8) []const u8 {

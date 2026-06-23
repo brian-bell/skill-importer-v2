@@ -500,6 +500,34 @@ test "broken_symlink reports broken_symlink and enablement false" {
     try testing.expect(!s.enablement.claude_code);
 }
 
+// --- broken_symlink (Finding #9): a symlink whose target CANNOT BE RESOLVED for
+// a reason OTHER than FileNotFound (here a self-referential loop => SymLinkLoop)
+// is still broken, not external. Per spec "Inventory": broken_symlink has
+// enablement FALSE; spec "Terms": an External entry is a symlink to a target
+// OUTSIDE managed roots, i.e. one that resolves but lands elsewhere. A symlink
+// whose target does not resolve at all is broken, never external. ---
+
+test "broken_symlink: a symlink-loop target (stat error, not FileNotFound) is broken not external" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+    // A self-referential symlink: claude/loopy -> claude/loopy. A no-follow stat
+    // reports `.sym_link`; following it yields error.SymLinkLoop (NOT
+    // FileNotFound). The target is unresolvable => broken_symlink.
+    try fx.symlink("loopy", "claude/loopy");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inv = try discover(&roots, arena);
+    try testing.expectEqual(@as(usize, 1), inv.skills.len);
+    const s = inv.skills[0];
+    try testing.expectEqual(types.SkillSource.agent_only, s.source);
+    try testing.expectEqual(types.AgentEntryStatus.broken_symlink, s.agent_entries.claude_code);
+    try testing.expect(!s.enablement.claude_code);
+}
+
 // --- agent_only skill: a real directory in an agent root only (spec "Terms":
 // Agent-only skill; spec "Inventory": skill_directory => source agent_only,
 // enablement true). ---

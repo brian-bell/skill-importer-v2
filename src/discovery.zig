@@ -200,15 +200,20 @@ fn classifyAgentEntry(
     switch (entry.kind) {
         .directory => return .skill_directory,
         .sym_link => {
-            // Broken if the target does not exist (follow the link end-to-end).
-            const exists = blk: {
-                _ = dir.statFile(io, entry.name, .{ .follow_symlinks = true }) catch |err| switch (err) {
-                    error.FileNotFound => break :blk false,
-                    else => break :blk true,
-                };
+            // Broken unless the target RESOLVES (follow the link end-to-end). Only
+            // a successful stat means the target is reachable; ANY error means the
+            // target cannot be resolved — FileNotFound (dangling), SymLinkLoop,
+            // AccessDenied through the chain, etc. A symlink whose target cannot be
+            // resolved is broken, NOT external (spec "Terms": an External entry is
+            // a symlink to a target OUTSIDE managed roots — one that resolves but
+            // lands elsewhere; spec "Inventory": broken_symlink has enablement
+            // false). Classifying an unresolvable link as external_symlink would
+            // wrongly report enablement=true (Finding #9).
+            const resolves = blk: {
+                _ = dir.statFile(io, entry.name, .{ .follow_symlinks = true }) catch break :blk false;
                 break :blk true;
             };
-            if (!exists) return .broken_symlink;
+            if (!resolves) return .broken_symlink;
 
             var buf: [std.fs.max_path_bytes]u8 = undefined;
             const n = try dir.readLink(io, entry.name, &buf);

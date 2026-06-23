@@ -469,3 +469,29 @@ test "disable: later unsafe agent leaves earlier managed symlink untouched (spec
     // later-agent preflight failure).
     try testing.expectEqual(std.Io.File.Kind.sym_link, (try entryKind(&h, "claude/omi")).?);
 }
+
+// --- disable: a BROKEN managed symlink is UNSAFE and must be left untouched
+// (Finding #8). spec "disable": "If the agent entry is the correct managed
+// symlink, remove it." + "Unsafe entries are rejected and left untouched."
+// spec "Terms"/"enable": a broken symlink is an External entry / unsafe entry.
+// A managed symlink whose target dir (here the imports draft) does NOT exist is
+// broken; disable must NOT remove it just because the lexical target matches. ---
+
+test "disable: broken managed symlink is unsafe and left on disk (spec disable, Finding #8)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    // The skill is discoverable via canonical (so disable resolves it), but the
+    // agent entry is a managed symlink pointing at the imports DRAFT dir which
+    // does NOT exist on disk => a broken symlink (discovery: broken_symlink).
+    try h.fixtures().writeSkill("canonical/brk", "brk", "Broken-link target.");
+    // claude/brk -> <imports>/brk, and <imports>/brk is never created.
+    try h.fixtures().managedSymlink(.claude, "brk", .imports, "brk");
+    var c = h.ctx();
+
+    // disable must REJECT the broken symlink as unsafe, not remove it.
+    try expectErrKind(ops.disable(&c, "brk", &.{.claude_code}), .unsafe_agent_entry);
+
+    // The broken symlink is still on disk, untouched, and still dangling.
+    try testing.expectEqual(std.Io.File.Kind.sym_link, (try entryKind(&h, "claude/brk")).?);
+    try testing.expectError(error.FileNotFound, h.roots.dir().statFile(io, "claude/brk", .{ .follow_symlinks = true }));
+}
