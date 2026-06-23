@@ -45,7 +45,7 @@ pub const RealFetcher = struct {
     threaded: std.Io.Threaded,
 
     pub fn init(gpa: std.mem.Allocator) RealFetcher {
-        return .{ .threaded = .init(gpa) };
+        return .{ .threaded = .init(gpa, .{}) };
     }
 
     pub fn deinit(self: *RealFetcher) void {

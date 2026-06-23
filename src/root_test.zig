@@ -27,4 +27,9 @@ comptime {
     _ = @import("ops.zig");
     _ = @import("ops_test.zig");
     _ = @import("promote_test.zig");
+    _ = @import("roots.zig");
+    _ = @import("roots_test.zig");
+    _ = @import("cli.zig");
+    _ = @import("cli_test.zig");
+    _ = @import("cli_integration_test.zig");
 }
