@@ -401,7 +401,7 @@ fn dup(c: *Context, s: []const u8) []const u8 {
 }
 
 fn oom() Result {
-    return .{ .err = .{ .kind = .io_error, .reason = "out of memory" } };
+    return .{ .err = .{ .kind = .out_of_memory, .reason = "out of memory" } };
 }
 
 fn ioErr(reason: []const u8, p: []const u8) Result {

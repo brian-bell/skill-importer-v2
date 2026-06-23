@@ -310,6 +310,7 @@ fn kindMessage(kind: result.ErrorKind) []const u8 {
         .repository_error => "failed to process the repository",
         .enabled_import => "the import is enabled; disable it first",
         .io_error => "a filesystem operation failed",
+        .out_of_memory => "out of memory",
     };
 }
 

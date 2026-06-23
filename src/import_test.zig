@@ -18,6 +18,8 @@ const json_out = @import("json_out.zig");
 const manifest_mod = @import("manifest.zig");
 const testutil = @import("testutil.zig");
 const net = @import("net.zig");
+const result_mod = @import("result.zig");
+const hash = @import("hash.zig");
 
 // --- helpers ---------------------------------------------------------------
 
@@ -621,3 +623,322 @@ test "import markdown rolls back the created directory when a later write fails"
     try testing.expect(!h.importsExists("alpha/SKILL.md"));
     try testing.expect(!h.importsExists("alpha/import.json"));
 }
+
+// --- H5(1): the imported_at persisted on disk equals the result's imported_at
+// for the `import path` (local file) and `import url` cases too, with EXACTLY
+// one clock.now() call. The clock advances on every call, so any code path that
+// reads now() twice (once for disk, once for the result) diverges and fails.
+// Locks the single-now() invariant across all non-repository import entries
+// (spec "Import Manifest": imported_at; "JSON Schemas > Import Result"). ---
+
+test "import path persists the same imported_at on disk and in the result (single now())" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+    try fx.writeSupportFile("src", "alpha.md", valid_md);
+    const src_path = try std.fs.path.join(h.arena(), &.{ h.roots.base, "src", "alpha.md" });
+
+    var clk: testutil.IncrementingClock = .{ .value = 1710000000, .step = 1000 };
+    var c: importmod.Context = .{
+        .arena = h.arena(),
+        .io = io,
+        .imports_root = h.roots.imports,
+        .canonical_root = h.roots.canonical,
+        .clock = clk.clock(),
+    };
+
+    const r = switch (importmod.path(&c, src_path)) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+
+    const bytes = try h.readImports("alpha/import.json");
+    const parsed = try manifest_mod.parse(testing.allocator, bytes);
+    defer parsed.deinit();
+    try testing.expectEqual(r.manifest.imported_at, parsed.value.imported_at);
+    try testing.expectEqual(@as(usize, 1), clk.calls);
+}
+
+test "import path directory persists the same imported_at on disk and in the result (single now())" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+    try fx.writeSkill("src/alpha", "alpha", "Alpha dir skill.");
+    try fx.writeSupportFile("src/alpha", "helper.txt", "support data");
+    const src_dir = try std.fs.path.join(h.arena(), &.{ h.roots.base, "src", "alpha" });
+
+    var clk: testutil.IncrementingClock = .{ .value = 1710000000, .step = 1000 };
+    var c: importmod.Context = .{
+        .arena = h.arena(),
+        .io = io,
+        .imports_root = h.roots.imports,
+        .canonical_root = h.roots.canonical,
+        .clock = clk.clock(),
+    };
+
+    const r = switch (importmod.path(&c, src_dir)) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+
+    const bytes = try h.readImports("alpha/import.json");
+    const parsed = try manifest_mod.parse(testing.allocator, bytes);
+    defer parsed.deinit();
+    try testing.expectEqual(r.manifest.imported_at, parsed.value.imported_at);
+    try testing.expectEqual(@as(usize, 1), clk.calls);
+}
+
+test "import url persists the same imported_at on disk and in the result (single now())" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var ff: testutil.FakeFetcher = .{ .body = valid_md };
+
+    var clk: testutil.IncrementingClock = .{ .value = 1710000000, .step = 1000 };
+    var c: importmod.Context = .{
+        .arena = h.arena(),
+        .io = io,
+        .imports_root = h.roots.imports,
+        .canonical_root = h.roots.canonical,
+        .clock = clk.clock(),
+    };
+
+    const r = switch (importmod.url(&c, ff.fetcher(), "https://example.test/alpha.md")) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+
+    const bytes = try h.readImports("alpha/import.json");
+    const parsed = try manifest_mod.parse(testing.allocator, bytes);
+    defer parsed.deinit();
+    try testing.expectEqual(r.manifest.imported_at, parsed.value.imported_at);
+    try testing.expectEqual(@as(usize, 1), clk.calls);
+}
+
+// --- H5(2): an allocator failure must surface as a dedicated out-of-memory
+// error kind, NOT be mislabeled as a generic io_error (spec "Output Contract":
+// "Error text should include the failing operation"; an OOM is not a filesystem
+// failure). The first allocation in markdown() is the content hash; a
+// FailingAllocator that fails at index 0 drives that OOM path. ---
+
+test "import markdown surfaces out_of_memory (not io_error) on allocator failure" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+
+    // Fail the very first allocation. frontmatter.parse does not allocate, so the
+    // first allocation is hash.hashString — exercising the OOM catch in markdown().
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var clk: testutil.FixedClock = .{ .value = 1710000000 };
+    var c: importmod.Context = .{
+        .arena = failing.allocator(),
+        .io = io,
+        .imports_root = roots.imports,
+        .canonical_root = roots.canonical,
+        .clock = clk.clock(),
+    };
+
+    switch (importmod.markdown(&c, valid_md, "clipboard")) {
+        .ok => return error.ExpectedError,
+        .err => |e| try testing.expectEqual(result_mod.ErrorKind.out_of_memory, e.kind),
+    }
+}
+
+// --- H5(3): a markdown import with NO --source-location must OMIT source_location
+// (not emit null) both in the result JSON and on disk in import.json (spec
+// "Import Manifest": "source_location: Optional source identifier"). ---
+
+test "import markdown without source_location omits the field in result JSON and on disk" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var c = h.ctx();
+
+    const r = switch (importmod.markdown(&c, valid_md, null)) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+    // Domain value is null (absent).
+    try testing.expect(r.manifest.source_location == null);
+
+    // Result JSON omits the key (and emits no null at all).
+    const json = try renderImportJson(&h, r);
+    try testing.expect(std.mem.indexOf(u8, json, "\"source_location\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "null") == null);
+
+    // On-disk import.json omits the key too.
+    const disk = try h.readImports("alpha/import.json");
+    try testing.expect(std.mem.indexOf(u8, disk, "\"source_location\"") == null);
+    try testing.expect(std.mem.indexOf(u8, disk, "null") == null);
+    // Sanity: source_type IS present so we know we read a real manifest.
+    try testing.expect(std.mem.indexOf(u8, disk, "\"source_type\": \"markdown\"") != null);
+}
+
+// --- H5(3) contrast: a markdown import WITH --source-location DOES emit it. ---
+
+test "import markdown with source_location emits the field in result JSON and on disk" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var c = h.ctx();
+
+    const r = switch (importmod.markdown(&c, valid_md, "clipboard")) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+    try testing.expectEqualStrings("clipboard", r.manifest.source_location.?);
+
+    const json = try renderImportJson(&h, r);
+    try testing.expect(std.mem.indexOf(u8, json, "\"source_location\": \"clipboard\"") != null);
+
+    const disk = try h.readImports("alpha/import.json");
+    try testing.expect(std.mem.indexOf(u8, disk, "\"source_location\": \"clipboard\"") != null);
+}
+
+// --- H5(4): a missing / nonexistent source path produces an error (no crash,
+// no storage), surfaced as the io_error kind with a "not found" reason rather
+// than the symlink/unsupported branch (spec "import path"). ---
+
+test "import path on a missing source path errors with no storage" {
+    var h = try Harness.init();
+    defer h.deinit();
+    const missing = try std.fs.path.join(h.arena(), &.{ h.roots.base, "src", "does-not-exist.md" });
+
+    var c = h.ctx();
+    switch (importmod.path(&c, missing)) {
+        .ok => return error.ExpectedError,
+        .err => |e| {
+            try testing.expectEqual(result_mod.ErrorKind.io_error, e.kind);
+            // It is NOT misclassified as a symlink / unsupported entry.
+            try testing.expect(e.kind != .unsupported_entry);
+        },
+    }
+    try testing.expect(!h.importsExists("alpha"));
+}
+
+// --- H5(4): a standalone .md FILE with invalid frontmatter is a validation
+// error and leaves NO partial storage (spec "import path" + "Import validation
+// fails before storage is created"). ---
+
+test "import path on a standalone markdown file with invalid frontmatter writes nothing" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+    // A real file, but its frontmatter has no closing delimiter.
+    try fx.writeSupportFile("src", "bad.md", "---\nname: alpha\ndescription: x\n");
+    const src_path = try std.fs.path.join(h.arena(), &.{ h.roots.base, "src", "bad.md" });
+
+    var c = h.ctx();
+    try expectErr(importmod.path(&c, src_path), .missing_close_delimiter);
+    // No storage created for the (would-be) skill name.
+    try testing.expect(!h.importsExists("alpha"));
+}
+
+// --- H5(6): a directory import's content_hash is computed by hashDirectory
+// (including supporting files) and that SAME hash flows into both the result
+// manifest AND the on-disk import.json (spec "import path": "The directory
+// content hash includes supporting files and relative paths"; "Import
+// Manifest": content_hash). Changing a supporting file changes the hash, and
+// disk == result in all cases. ---
+
+test "import path directory content_hash from hashDirectory flows into result and disk" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+    try fx.writeSkill("src/alpha", "alpha", "Alpha dir skill.");
+    try fx.writeSupportFile("src/alpha", "helper.txt", "support data");
+    const src_dir = try std.fs.path.join(h.arena(), &.{ h.roots.base, "src", "alpha" });
+
+    var c = h.ctx();
+    const r = switch (importmod.path(&c, src_dir)) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+
+    // Independently compute the directory hash and confirm the result carries it.
+    var dir = try h.roots.dir().openDir(io, "src/alpha", .{ .iterate = true });
+    defer dir.close(io);
+    const expected = try hash.hashDirectory(testing.allocator, io, dir);
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, r.manifest.content_hash);
+    try testing.expect(std.mem.startsWith(u8, r.manifest.content_hash, "sha256:"));
+
+    // The on-disk import.json carries the identical content_hash.
+    const bytes = try h.readImports("alpha/import.json");
+    const parsed = try manifest_mod.parse(testing.allocator, bytes);
+    defer parsed.deinit();
+    try testing.expectEqualStrings(r.manifest.content_hash, parsed.value.content_hash);
+
+    // It is a directory hash, not the hash of SKILL.md alone (supporting file
+    // included) — differs from hashing SKILL.md's bytes.
+    const skill_bytes = try h.readImports("alpha/SKILL.md");
+    const skill_only = try hash.hashString(testing.allocator, skill_bytes);
+    defer testing.allocator.free(skill_only);
+    try testing.expect(!std.mem.eql(u8, skill_only, r.manifest.content_hash));
+}
+
+// --- H5(7): an `import url` that fetches a non-2xx HTTP status from a real
+// loopback server fails as fetch_failed and creates NO storage (spec "import
+// url": "On fetch ... failure, do not create import storage."). Uses the real
+// std.http-backed fetcher against a loopback std.http.Server so the non-2xx
+// status -> error.FetchFailed mapping in net.fetchOnce is exercised end-to-end. ---
+
+test "import url with a non-2xx HTTP status fails fetch_failed and writes nothing" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    var ls = try StatusServer.start(404);
+    defer ls.deinit();
+    try ls.spawn();
+    const target = try ls.url(h.arena());
+
+    var rf = net.RealFetcher.init(testing.allocator);
+    defer rf.deinit();
+
+    var c = h.ctx();
+    switch (importmod.url(&c, rf.fetcher(), target)) {
+        .ok => return error.ExpectedError,
+        .err => |e| try testing.expectEqual(result_mod.ErrorKind.fetch_failed, e.kind),
+    }
+    try testing.expect(!h.importsExists("alpha"));
+}
+
+/// A loopback HTTP server that serves one connection and responds with a fixed
+/// (non-2xx) status and an empty body. Safety: binds IPv4 loopback on an
+/// ephemeral port, torn down per test; no real network or user roots touched.
+const StatusServer = struct {
+    server: std.Io.net.Server,
+    port: u16,
+    thread: ?std.Thread = null,
+    status: u16,
+
+    fn start(status: u16) !StatusServer {
+        var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const server = try addr.listen(io, .{ .mode = .stream, .reuse_address = true });
+        return .{ .server = server, .port = server.socket.address.getPort(), .status = status };
+    }
+
+    fn run(self: *StatusServer) void {
+        var srv = self.server;
+        var stream = srv.accept(io) catch return;
+        defer stream.close(io);
+
+        var read_buf: [16 * 1024]u8 = undefined;
+        var write_buf: [16 * 1024]u8 = undefined;
+        var sr = stream.reader(io, &read_buf);
+        var sw = stream.writer(io, &write_buf);
+
+        var http_server = std.http.Server.init(&sr.interface, &sw.interface);
+        var request = http_server.receiveHead() catch return;
+        request.respond("", .{ .status = @enumFromInt(self.status) }) catch return;
+    }
+
+    fn spawn(self: *StatusServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn url(self: *StatusServer, gpa: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/skill.md", .{self.port});
+    }
+
+    fn deinit(self: *StatusServer) void {
+        if (self.thread) |t| t.join();
+        self.server.deinit(io);
+    }
+};

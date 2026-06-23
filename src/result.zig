@@ -62,6 +62,11 @@ pub const ErrorKind = enum {
 
     // --- unexpected I/O surfacing partial actions (spec "Filesystem Safety") ---
     io_error,
+
+    // --- allocator exhaustion. Distinct from io_error: an OOM is not a
+    // filesystem failure, so it must not be reported as one (spec "Output
+    // Contract": error text names the failing operation). ---
+    out_of_memory,
 };
 
 /// Rich error payload. All strings are arena-owned by the caller's operation
