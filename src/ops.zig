@@ -482,7 +482,11 @@ fn promoteRun(c: *Context, skill_name: []const u8, overwrite: bool) anyerror!Res
         defer src.close(c.io);
         var dst = try cwd.openDir(c.io, staging_dir, .{});
         defer dst.close(c.io);
-        copyExcludingManifest(c, src, dst, staging_dir, "", &actions) catch |err| {
+        // Record copy_file action paths against the FINAL destination
+        // (<canonical>/<name>/...), not the transient staging dir — after the
+        // swap the staging path no longer exists (spec promote / Skill Operation
+        // Result copy_file 'path' / Filesystem Safety step 5).
+        copyExcludingManifest(c, src, dst, dest_dir, "", &actions) catch |err| {
             cwd.deleteTree(c.io, staging_dir) catch {};
             return err;
         };

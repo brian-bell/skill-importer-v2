@@ -284,6 +284,44 @@ pub const FailingIo = struct {
     }
 };
 
+/// A `std.Io` wrapper that delegates to the real test IO for everything EXCEPT a
+/// `rename` whose SOURCE (old) path basename equals `fail_old_basename`, which it
+/// fails with `error.CrossDevice`. Keying on the source basename lets
+/// a test fail one specific rename (e.g. the promote `.<name>.staging -> <name>`
+/// swap) WITHOUT also failing the recovery rename (`.<name>.old -> <name>`),
+/// which has a different source basename. This drives promote's swap-failure
+/// restore path (spec promote: "the existing canonical copy must not be removed
+/// until the replacement copy is known to be valid and ready"). Single-threaded
+/// test use only.
+pub const FailingRenameIo = struct {
+    var vtable: std.Io.VTable = undefined;
+    var orig_rename: *const fn (?*anyopaque, std.Io.Dir, []const u8, std.Io.Dir, []const u8) std.Io.Dir.RenameError!void = undefined;
+    var fail_old_basename: []const u8 = "";
+
+    /// Build a failing IO that fails `dirRename` when the source path basename
+    /// equals `old_basename`.
+    pub fn forOldBasename(old_basename: []const u8) std.Io {
+        vtable = io.vtable.*;
+        orig_rename = vtable.dirRename;
+        fail_old_basename = old_basename;
+        vtable.dirRename = renameOverride;
+        return .{ .userdata = io.userdata, .vtable = &vtable };
+    }
+
+    fn renameOverride(
+        ud: ?*anyopaque,
+        old_dir: std.Io.Dir,
+        old_sub_path: []const u8,
+        new_dir: std.Io.Dir,
+        new_sub_path: []const u8,
+    ) std.Io.Dir.RenameError!void {
+        if (std.mem.eql(u8, std.fs.path.basename(old_sub_path), fail_old_basename)) {
+            return error.CrossDevice;
+        }
+        return orig_rename(ud, old_dir, old_sub_path, new_dir, new_sub_path);
+    }
+};
+
 /// Network fetcher abstraction. The canonical interface lives in net.zig so the
 /// real (std.http-backed) and fake fetchers share one type; re-exported here for
 /// test convenience (zig-clean-room-cli.md: fake net provider).

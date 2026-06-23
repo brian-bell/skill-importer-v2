@@ -221,6 +221,39 @@ test "promote: copies SKILL.md + support files, excludes import.json, sets manif
     try testing.expect(man.promoted);
 }
 
+test "promote: every copy_file action path points at an existing file under canonical/<name> (spec promote/Skill Operation Result copy_file 'path')" {
+    // Spec: the action list describes WHAT HAPPENED with the specific path
+    // (Filesystem Safety step 5; JSON Schemas > Skill Operation Result copy_file
+    // 'path'). promote stages into a sibling .<name>.staging dir then swaps; the
+    // recorded copy_file paths must name the FINAL destination
+    // (<canonical>/<name>/...), not the now-deleted staging dir.
+    var h = try Harness.init();
+    defer h.deinit();
+    try draft(&h, "rho", "rho", "Rho draft.");
+    try h.fixtures().writeSupportFile("imports/rho", "helper.txt", "support-data");
+    try h.fixtures().writeSupportFile("imports/rho/sub", "nested.txt", "nested-data");
+    var c = h.ctx();
+
+    const r = try expectOk(ops.promote(&c, "rho", false));
+
+    const dest_dir = try canonicalPath(&h, "rho");
+    var saw_copy = false;
+    for (r.actions) |a| {
+        if (a.action != .copy_file) continue;
+        saw_copy = true;
+        // The recorded path must be under the FINAL canonical/<name> dir...
+        try testing.expect(std.mem.startsWith(u8, a.path, dest_dir));
+        // ...and must name a file that actually exists on disk after the swap
+        // (the staging path would not exist; it was renamed away).
+        const st = std.Io.Dir.cwd().statFile(io, a.path, .{ .follow_symlinks = false }) catch |err| {
+            std.debug.print("copy_file action path does not exist: {s} ({any})\n", .{ a.path, err });
+            return error.CopyFilePathMissing;
+        };
+        try testing.expectEqual(std.Io.File.Kind.file, st.kind);
+    }
+    try testing.expect(saw_copy);
+}
+
 test "promote: stage-then-swap leaves no staging/backup litter in canonical (spec promote)" {
     // The stage-then-swap implementation (spec promote: don't remove the old
     // canonical until the replacement is ready) must not leave temporary
@@ -371,6 +404,85 @@ test "promote --overwrite: dest whose SKILL.md name differs fails, dest untouche
     try testing.expect(std.mem.indexOf(u8, skill, "different-name") != null);
     const man = try readManifest(&h, "imports/iota");
     try testing.expect(!man.promoted);
+}
+
+// --- overwrite data-loss safety: failure injection -------------------------
+
+/// Assert no `.<name>.staging` / `.<name>.old` litter remains in canonical after
+/// a failed promote (the stage-then-swap temporaries must be cleaned up).
+fn expectNoStagingLitter(h: *Harness, name: []const u8) !void {
+    const staging = try std.fmt.allocPrint(h.arena(), "canonical/.{s}.staging", .{name});
+    const old = try std.fmt.allocPrint(h.arena(), "canonical/.{s}.old", .{name});
+    try testing.expectEqual(@as(?std.Io.File.Kind, null), try entryKind(h, staging));
+    try testing.expectEqual(@as(?std.Io.File.Kind, null), try entryKind(h, old));
+}
+
+test "promote --overwrite: a staged-copy failure leaves the OLD canonical copy intact (spec promote: don't remove the old copy until the replacement is ready)" {
+    // Spec promote: "With --overwrite, the existing canonical copy must not be
+    // removed until the replacement copy is known to be valid and ready."
+    // Inject a failure copying SKILL.md INTO the staging dir. The copy happens
+    // BEFORE the old dest is moved aside, so the original canonical copy and the
+    // draft manifest must be entirely untouched, and no staging/backup litter may
+    // remain. A naive delete-then-copy implementation would have already removed
+    // the old copy and would fail this test.
+    var h = try Harness.init();
+    defer h.deinit();
+    try draft(&h, "psi", "psi", "New psi.");
+    try h.fixtures().writeSkill("canonical/psi", "psi", "Old psi.");
+    try h.fixtures().writeSupportFile("canonical/psi", "keep.txt", "old-support");
+
+    // IO that fails the staging copy of SKILL.md.
+    const failing_io = testutil.FailingIo.forBasename("SKILL.md");
+    var c = h.ctx();
+    c.io = failing_io;
+
+    const res = ops.promote(&c, "psi", true);
+    try testing.expect(res == .err);
+
+    // The OLD canonical copy survives intact (content + support file).
+    const skill = try readFile(&h, "canonical/psi/SKILL.md");
+    try testing.expect(std.mem.indexOf(u8, skill, "Old psi.") != null);
+    try testing.expectEqualStrings("old-support", try readFile(&h, "canonical/psi/keep.txt"));
+    // The draft manifest stays unpromoted.
+    const man = try readManifest(&h, "imports/psi");
+    try testing.expect(!man.promoted);
+    // No stage/backup litter.
+    try expectNoStagingLitter(&h, "psi");
+}
+
+test "promote --overwrite: a swap-rename failure restores the original canonical copy (spec promote: don't remove the old copy until the replacement is ready)" {
+    // Spec promote: "With --overwrite, the existing canonical copy must not be
+    // removed until the replacement copy is known to be valid and ready." The
+    // stage-then-swap moves the old dest aside to .<name>.old, then renames the
+    // staging dir into place. Inject a failure on THAT swap rename (source
+    // basename .<name>.staging). The implementation must restore the original
+    // canonical copy from the backup, leaving no .old/.staging litter and the
+    // draft manifest unpromoted.
+    var h = try Harness.init();
+    defer h.deinit();
+    try draft(&h, "chi", "chi", "New chi.");
+    try h.fixtures().writeSkill("canonical/chi", "chi", "Old chi.");
+    try h.fixtures().writeSupportFile("canonical/chi", "keep.txt", "old-support");
+
+    // IO that fails ONLY the `.chi.staging -> chi` swap rename (keyed on the
+    // source basename), so the recovery `.chi.old -> chi` rename still succeeds.
+    const failing_io = testutil.FailingRenameIo.forOldBasename(".chi.staging");
+    var c = h.ctx();
+    c.io = failing_io;
+
+    const res = ops.promote(&c, "chi", true);
+    try testing.expect(res == .err);
+
+    // The original canonical copy is fully restored (content + support file).
+    try testing.expectEqual(std.Io.File.Kind.directory, (try entryKind(&h, "canonical/chi")).?);
+    const skill = try readFile(&h, "canonical/chi/SKILL.md");
+    try testing.expect(std.mem.indexOf(u8, skill, "Old chi.") != null);
+    try testing.expectEqualStrings("old-support", try readFile(&h, "canonical/chi/keep.txt"));
+    // The draft manifest stays unpromoted.
+    const man = try readManifest(&h, "imports/chi");
+    try testing.expect(!man.promoted);
+    // No stage/backup litter.
+    try expectNoStagingLitter(&h, "chi");
 }
 
 // ===========================================================================
