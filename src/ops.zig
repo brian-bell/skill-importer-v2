@@ -20,6 +20,8 @@ const types = @import("types.zig");
 const result = @import("result.zig");
 const discovery = @import("discovery.zig");
 const fsutil = @import("fsutil.zig");
+const frontmatter = @import("frontmatter.zig");
+const manifest_mod = @import("manifest.zig");
 
 const Result = result.Result(types.SkillOperationResult);
 
@@ -344,4 +346,461 @@ fn canonOrLexical(c: *Context, path: []const u8) ![]const u8 {
 
 fn dup(c: *Context, s: []const u8) []const u8 {
     return c.arena.dupe(u8, s) catch s;
+}
+
+// ===========================================================================
+// promote / unpromote / delete (cli-clean-room-spec.md "promote", "unpromote",
+// "delete", "Collision Rules", "Filesystem Safety").
+//
+// All three follow the spec's plan-then-execute discipline: resolve + classify
+// the skill, preflight every destination/agent entry for safety, then execute
+// only after preflight succeeds and record an action list.
+// ===========================================================================
+
+/// Resolve the FULL inventory entry for a skill (not just source/promoted) so
+/// promote/unpromote/delete can inspect agent entries (e.g. a legacy managed
+/// import symlink for delete) and the imported source_repository.
+fn resolveEntry(c: *Context, skill_name: []const u8) result.Result(types.SkillEntry) {
+    const inv = switch (discovery.discover(c.arena, c.io, c.roots())) {
+        .ok => |i| i,
+        .err => |e| return .{ .err = e },
+    };
+    for (inv.skills) |s| {
+        if (std.mem.eql(u8, s.name, skill_name)) return .{ .ok = s };
+    }
+    return .{ .err = .{ .kind = .unknown_skill, .name = dup(c, skill_name) } };
+}
+
+fn opRun(
+    c: *Context,
+    skill_name: []const u8,
+    comptime impl: fn (*Context, []const u8) anyerror!Result,
+) Result {
+    return impl(c, skill_name) catch |err| switch (err) {
+        error.OutOfMemory => .{ .err = .{ .kind = .io_error, .reason = "out of memory" } },
+        else => .{ .err = .{ .kind = .io_error, .name = dup(c, skill_name), .reason = @errorName(err) } },
+    };
+}
+
+// --- promote ---------------------------------------------------------------
+
+/// `promote` (spec): copy an imported draft skill from the imports root into the
+/// canonical root and mark the draft manifest promoted=true. With `overwrite`,
+/// an existing matching-name canonical destination is replaced via stage-then-
+/// swap so the old copy survives until the replacement is ready.
+pub fn promote(c: *Context, skill_name: []const u8, overwrite: bool) Result {
+    return promoteRun(c, skill_name, overwrite) catch |err| switch (err) {
+        error.OutOfMemory => .{ .err = .{ .kind = .io_error, .reason = "out of memory" } },
+        else => .{ .err = .{ .kind = .io_error, .name = dup(c, skill_name), .reason = @errorName(err) } },
+    };
+}
+
+fn promoteRun(c: *Context, skill_name: []const u8, overwrite: bool) anyerror!Result {
+    const cwd = std.Io.Dir.cwd();
+
+    // 1. Resolve + classify (spec promote: unknown/canonical/agent-only/already-
+    //    promoted fail).
+    const entry = switch (resolveEntry(c, skill_name)) {
+        .ok => |e| e,
+        .err => |e| return .{ .err = e },
+    };
+    switch (entry.source) {
+        .canonical => return .{ .err = .{ .kind = .canonical_only_skill, .name = dup(c, skill_name) } },
+        .agent_only => return .{ .err = .{ .kind = .agent_only_skill, .name = dup(c, skill_name) } },
+        .imported => if (entry.promoted) {
+            return .{ .err = .{ .kind = .already_promoted, .name = dup(c, skill_name) } };
+        },
+    }
+
+    const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, skill_name });
+    const dest_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, skill_name });
+
+    // 2a. Existing canonical destination: fail without --overwrite (spec promote +
+    //     "Collision Rules"). With --overwrite, an existing dest whose SKILL.md
+    //     frontmatter name differs still fails (spec promote).
+    const dest_exists = (try fsutil.classify(c.io, cwd, dest_dir)) != .missing;
+    if (dest_exists) {
+        if (!overwrite) {
+            return .{ .err = .{ .kind = .canonical_collision, .name = dup(c, skill_name), .path = dest_dir } };
+        }
+        const dest_name = try frontmatterNameOf(c, dest_dir);
+        if (dest_name == null or !std.mem.eql(u8, dest_name.?, skill_name)) {
+            return .{ .err = .{ .kind = .canonical_collision, .name = dup(c, skill_name), .path = dest_dir } };
+        }
+    }
+
+    // 2b. Frontmatter-name collision ANYWHERE else in canonical (spec "Collision
+    //     Rules": refuse frontmatter name collisions anywhere in canonical,
+    //     including a colliding dir with a different directory name). The dest dir
+    //     itself (same name) is excluded — that is the overwrite target.
+    switch (try frontmatterCollisionElsewhere(c, skill_name)) {
+        .ok => {},
+        .err => |e| return .{ .err = e },
+    }
+
+    // 2c. Unsupported entries (symlinks etc.) inside the import dir must fail
+    //     (spec promote). Detected up front by scanning the tree.
+    if (try treeHasUnsupportedEntry(c, import_dir)) {
+        return .{ .err = .{
+            .kind = .unsupported_entry,
+            .name = dup(c, skill_name),
+            .path = dup(c, import_dir),
+            .reason = "import directory contains a symlink or unsupported entry",
+        } };
+    }
+
+    // 2d. Preflight agent entries for this skill: any unsafe entry (real dir/file/
+    //     broken/external/wrong-target symlink) fails BEFORE mutation (spec
+    //     promote). Managed symlinks pointing at the import dir are relink targets.
+    const dest_canon = try canonOrLexical(c, dest_dir);
+    const import_canon = try canonOrLexical(c, import_dir);
+    var relinks: std.ArrayList(types.Agent) = .empty;
+    for ([_]types.Agent{ .claude_code, .codex }) |agent| {
+        switch (try preflightPromoteAgent(c, skill_name, agent, dest_canon, import_canon)) {
+            .ok => |needs_relink| if (needs_relink) try relinks.append(c.arena, agent),
+            .err => |e| return .{ .err = e },
+        }
+    }
+
+    // 3. Execute. Stage the new copy in a sibling staging dir on the same mount,
+    //    then swap (spec promote: "the existing canonical copy must not be removed
+    //    until the replacement copy is known to be valid and ready").
+    var actions: std.ArrayList(types.SkillAction) = .empty;
+
+    const canonical_created = (try fsutil.classify(c.io, cwd, c.canonical_root)) == .missing;
+    try cwd.createDirPath(c.io, c.canonical_root);
+    if (canonical_created) {
+        try actions.append(c.arena, .{ .action = .create_directory, .path = dup(c, c.canonical_root) });
+    }
+
+    const staging_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, try std.fmt.allocPrint(c.arena, ".{s}.staging", .{skill_name}) });
+    // Clean any leftover staging from a previous interrupted run.
+    cwd.deleteTree(c.io, staging_dir) catch {};
+    try cwd.createDirPath(c.io, staging_dir);
+    {
+        var src = try cwd.openDir(c.io, import_dir, .{ .iterate = true });
+        defer src.close(c.io);
+        var dst = try cwd.openDir(c.io, staging_dir, .{});
+        defer dst.close(c.io);
+        copyExcludingManifest(c, src, dst, staging_dir, "", &actions) catch |err| {
+            cwd.deleteTree(c.io, staging_dir) catch {};
+            return err;
+        };
+    }
+
+    // Swap: move any existing dest aside, move staging into place, drop the old.
+    if (dest_exists) {
+        const backup_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, try std.fmt.allocPrint(c.arena, ".{s}.old", .{skill_name}) });
+        cwd.deleteTree(c.io, backup_dir) catch {};
+        try cwd.rename(dest_dir, cwd, backup_dir, c.io);
+        cwd.rename(staging_dir, cwd, dest_dir, c.io) catch |err| {
+            // Restore the original on swap failure (replacement not ready).
+            cwd.rename(backup_dir, cwd, dest_dir, c.io) catch {};
+            cwd.deleteTree(c.io, staging_dir) catch {};
+            return err;
+        };
+        cwd.deleteTree(c.io, backup_dir) catch {};
+    } else {
+        try cwd.rename(staging_dir, cwd, dest_dir, c.io);
+    }
+
+    // Relink managed import symlinks to the canonical copy (spec promote).
+    for (relinks.items) |agent| {
+        const link_path = try std.fs.path.join(c.arena, &.{ c.agentRoot(agent), skill_name });
+        try cwd.deleteFile(c.io, link_path);
+        try actions.append(c.arena, .{ .action = .remove_symlink, .agent = agent, .path = dup(c, link_path) });
+        try cwd.symLink(c.io, dest_dir, link_path, .{});
+        try actions.append(c.arena, .{ .action = .create_symlink, .agent = agent, .path = dup(c, link_path), .target = dest_dir });
+    }
+
+    // Set the draft manifest promoted=true (spec promote).
+    try setManifestPromoted(c, import_dir, true, &actions);
+
+    return .{ .ok = .{
+        .skill_name = dup(c, skill_name),
+        .actions = try actions.toOwnedSlice(c.arena),
+    } };
+}
+
+/// Preflight one agent entry for promote. Returns ok(true) when the entry is a
+/// managed symlink pointing at the import dir (=> relink target), ok(false) when
+/// the entry is missing or already points at the canonical copy (nothing to do),
+/// or an unsafe-entry error otherwise (spec promote: unsafe agent entries fail
+/// before mutation).
+fn preflightPromoteAgent(
+    c: *Context,
+    skill_name: []const u8,
+    agent: types.Agent,
+    dest_canon: []const u8,
+    import_canon: []const u8,
+) anyerror!result.Result(bool) {
+    const link_path = try std.fs.path.join(c.arena, &.{ c.agentRoot(agent), skill_name });
+    const kind = try fsutil.classify(c.io, std.Io.Dir.cwd(), link_path);
+    switch (kind) {
+        .missing => return .{ .ok = false },
+        .symlink => {
+            if (try symlinkPointsAtCanon(c, link_path, import_canon)) return .{ .ok = true };
+            if (try symlinkPointsAtCanon(c, link_path, dest_canon)) return .{ .ok = false };
+            return .{ .err = .{ .kind = .unsafe_agent_entry, .path = dup(c, link_path) } };
+        },
+        .directory, .file => return .{ .err = .{ .kind = .unsafe_agent_entry, .path = dup(c, link_path) } },
+    }
+}
+
+// --- unpromote -------------------------------------------------------------
+
+/// `unpromote` (spec): remove the canonical promoted copy of an imported skill,
+/// remove managed agent symlinks to that copy, and mark the draft manifest
+/// promoted=false.
+pub fn unpromote(c: *Context, skill_name: []const u8) Result {
+    return opRun(c, skill_name, unpromoteRun);
+}
+
+fn unpromoteRun(c: *Context, skill_name: []const u8) anyerror!Result {
+    const cwd = std.Io.Dir.cwd();
+
+    const entry = switch (resolveEntry(c, skill_name)) {
+        .ok => |e| e,
+        .err => |e| return .{ .err = e },
+    };
+    switch (entry.source) {
+        .canonical => return .{ .err = .{ .kind = .canonical_only_skill, .name = dup(c, skill_name) } },
+        .agent_only => return .{ .err = .{ .kind = .agent_only_skill, .name = dup(c, skill_name) } },
+        .imported => if (!entry.promoted) {
+            return .{ .err = .{ .kind = .not_promoted, .name = dup(c, skill_name) } };
+        },
+    }
+
+    const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, skill_name });
+    const dest_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, skill_name });
+    const dest_canon = try canonOrLexical(c, dest_dir);
+
+    var actions: std.ArrayList(types.SkillAction) = .empty;
+
+    // Remove managed agent symlinks pointing at the canonical copy (spec
+    // unpromote). Any OTHER agent entry (external/broken/real) is left untouched
+    // (spec "Filesystem Safety").
+    for ([_]types.Agent{ .claude_code, .codex }) |agent| {
+        const link_path = try std.fs.path.join(c.arena, &.{ c.agentRoot(agent), skill_name });
+        const kind = try fsutil.classify(c.io, cwd, link_path);
+        if (kind == .symlink and try symlinkPointsAtCanon(c, link_path, dest_canon)) {
+            try cwd.deleteFile(c.io, link_path);
+            try actions.append(c.arena, .{ .action = .remove_symlink, .agent = agent, .path = dup(c, link_path) });
+        }
+    }
+
+    // Remove the canonical copy (spec unpromote).
+    if ((try fsutil.classify(c.io, cwd, dest_dir)) != .missing) {
+        try cwd.deleteTree(c.io, dest_dir);
+        try actions.append(c.arena, .{ .action = .remove_directory, .path = dest_dir });
+    }
+
+    // Mark the draft manifest promoted=false (spec unpromote).
+    try setManifestPromoted(c, import_dir, false, &actions);
+
+    return .{ .ok = .{
+        .skill_name = dup(c, skill_name),
+        .actions = try actions.toOwnedSlice(c.arena),
+    } };
+}
+
+// --- delete ----------------------------------------------------------------
+
+/// `delete` (spec): delete an unpromoted imported draft skill. Promoted imports
+/// fail (unpromote first); legacy-enabled imports fail (disable first); unrelated
+/// same-name agent entries do not block and are left untouched.
+pub fn delete(c: *Context, skill_name: []const u8) Result {
+    return opRun(c, skill_name, deleteRun);
+}
+
+fn deleteRun(c: *Context, skill_name: []const u8) anyerror!Result {
+    const cwd = std.Io.Dir.cwd();
+
+    const entry = switch (resolveEntry(c, skill_name)) {
+        .ok => |e| e,
+        .err => |e| return .{ .err = e },
+    };
+    switch (entry.source) {
+        .canonical => return .{ .err = .{ .kind = .canonical_only_skill, .name = dup(c, skill_name) } },
+        .agent_only => return .{ .err = .{ .kind = .agent_only_skill, .name = dup(c, skill_name) } },
+        .imported => if (entry.promoted) {
+            // Promoted imports must be unpromoted first (spec delete).
+            return .{ .err = .{ .kind = .already_promoted, .name = dup(c, skill_name) } };
+        },
+    }
+
+    // Legacy-enabled: a managed symlink to the IMPORT dir in any agent root blocks
+    // deletion (spec delete: "Imports enabled through legacy managed import
+    // symlinks fail; disable first"). Note this is the imported_symlink status,
+    // distinct from an unrelated same-name unsafe entry (real dir / external /
+    // broken symlink), which does NOT block and is left untouched.
+    if (entry.agent_entries.claude_code == .imported_symlink or
+        entry.agent_entries.codex == .imported_symlink)
+    {
+        return .{ .err = .{ .kind = .enabled_import, .name = dup(c, skill_name) } };
+    }
+
+    const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, skill_name });
+
+    var actions: std.ArrayList(types.SkillAction) = .empty;
+    try cwd.deleteTree(c.io, import_dir);
+    try actions.append(c.arena, .{ .action = .remove_directory, .path = import_dir });
+
+    return .{ .ok = .{
+        .skill_name = dup(c, skill_name),
+        .actions = try actions.toOwnedSlice(c.arena),
+    } };
+}
+
+// --- promote/unpromote/delete helpers --------------------------------------
+
+/// Read the SKILL.md frontmatter `name` of an existing canonical directory, or
+/// null if absent / invalid.
+fn frontmatterNameOf(c: *Context, dir_path: []const u8) !?[]const u8 {
+    const skill_path = try std.fs.path.join(c.arena, &.{ dir_path, "SKILL.md" });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(c.io, skill_path, c.arena, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return switch (frontmatter.parse(c.arena, bytes)) {
+        .ok => |m| try c.arena.dupe(u8, m.name),
+        .err => null,
+    };
+}
+
+/// Refuse a frontmatter-name collision anywhere ELSE in the canonical root: a
+/// canonical directory (with a DIFFERENT directory name than `skill_name`) whose
+/// SKILL.md frontmatter name equals `skill_name` (spec "Collision Rules"). The
+/// same-name directory is the overwrite target and is excluded here.
+fn frontmatterCollisionElsewhere(c: *Context, skill_name: []const u8) anyerror!result.Result(void) {
+    var dir = std.Io.Dir.cwd().openDir(c.io, c.canonical_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .ok = {} },
+        else => return err,
+    };
+    defer dir.close(c.io);
+
+    var it = dir.iterate();
+    while (try it.next(c.io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (std.mem.eql(u8, entry.name, skill_name)) continue; // overwrite target
+        const sub_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, entry.name });
+        const existing = (try frontmatterNameOf(c, sub_dir)) orelse continue;
+        if (std.mem.eql(u8, existing, skill_name)) {
+            return .{ .err = .{
+                .kind = .frontmatter_name_collision,
+                .name = dup(c, skill_name),
+                .path = sub_dir,
+            } };
+        }
+    }
+    return .{ .ok = {} };
+}
+
+/// True iff the tree rooted at `dir_path` contains any entry that is neither a
+/// regular file nor a directory (e.g. a symlink) — an unsupported entry for the
+/// promotion copy (spec promote).
+fn treeHasUnsupportedEntry(c: *Context, dir_path: []const u8) anyerror!bool {
+    var dir = try std.Io.Dir.cwd().openDir(c.io, dir_path, .{ .iterate = true });
+    defer dir.close(c.io);
+    var it = dir.iterate();
+    while (try it.next(c.io)) |entry| {
+        switch (entry.kind) {
+            .file => {},
+            .directory => {
+                const sub = try std.fs.path.join(c.arena, &.{ dir_path, entry.name });
+                if (try treeHasUnsupportedEntry(c, sub)) return true;
+            },
+            else => return true,
+        }
+    }
+    return false;
+}
+
+/// Recursively copy `src` into `dst`, EXCLUDING a top-level `import.json` (spec
+/// promote: "Promotion ... excludes top-level import.json"). Records a copy_file
+/// action per regular file. `rel` is the path under the destination root used to
+/// build absolute action paths; only the top level excludes import.json.
+fn copyExcludingManifest(
+    c: *Context,
+    src: std.Io.Dir,
+    dst: std.Io.Dir,
+    dest_root: []const u8,
+    rel: []const u8,
+    actions: *std.ArrayList(types.SkillAction),
+) anyerror!void {
+    const at_top = rel.len == 0;
+    var it = src.iterate();
+    while (try it.next(c.io)) |entry| {
+        switch (entry.kind) {
+            .file => {
+                if (at_top and std.mem.eql(u8, entry.name, "import.json")) continue;
+                try src.copyFile(entry.name, dst, entry.name, c.io, .{});
+                const abs = try joinAbsRel(c, dest_root, rel, entry.name);
+                try actions.append(c.arena, .{ .action = .copy_file, .path = abs });
+            },
+            .directory => {
+                try dst.createDirPath(c.io, entry.name);
+                var sub_src = try src.openDir(c.io, entry.name, .{ .iterate = true });
+                defer sub_src.close(c.io);
+                var sub_dst = try dst.openDir(c.io, entry.name, .{});
+                defer sub_dst.close(c.io);
+                const sub_rel = if (rel.len == 0) entry.name else try std.fs.path.join(c.arena, &.{ rel, entry.name });
+                try copyExcludingManifest(c, sub_src, sub_dst, dest_root, sub_rel, actions);
+            },
+            else => return error.UnsupportedEntry,
+        }
+    }
+}
+
+fn joinAbsRel(c: *Context, base: []const u8, rel: []const u8, name: []const u8) ![]const u8 {
+    if (rel.len == 0) return std.fs.path.join(c.arena, &.{ base, name });
+    return std.fs.path.join(c.arena, &.{ base, rel, name });
+}
+
+/// Read the draft manifest, set its `promoted` flag, and rewrite import.json
+/// (2-space indent, no trailing newline). Records a write_manifest action.
+fn setManifestPromoted(
+    c: *Context,
+    import_dir: []const u8,
+    promoted: bool,
+    actions: *std.ArrayList(types.SkillAction),
+) anyerror!void {
+    const manifest_path = try std.fs.path.join(c.arena, &.{ import_dir, "import.json" });
+    const cwd = std.Io.Dir.cwd();
+    const bytes = cwd.readFileAlloc(c.io, manifest_path, c.arena, .unlimited) catch |err| switch (err) {
+        // No manifest to update (a draft may predate import.json); nothing to do.
+        error.FileNotFound => return,
+        else => return err,
+    };
+    var parsed = try manifest_mod.parse(c.arena, bytes);
+    defer parsed.deinit();
+    const m: types.ImportManifest = .{
+        .source_type = parsed.value.source_type,
+        .source_location = if (parsed.value.source_location) |s| try c.arena.dupe(u8, s) else null,
+        .source_repository = if (parsed.value.source_repository) |sr| .{
+            .repository = try c.arena.dupe(u8, sr.repository),
+            .skill_path = try c.arena.dupe(u8, sr.skill_path),
+        } else null,
+        .imported_at = parsed.value.imported_at,
+        .content_hash = try c.arena.dupe(u8, parsed.value.content_hash),
+        .promoted = promoted,
+    };
+    const out = try manifest_mod.toBytes(c.arena, m);
+    try cwd.writeFile(c.io, .{ .sub_path = manifest_path, .data = out });
+    try actions.append(c.arena, .{ .action = .write_manifest, .path = dup(c, manifest_path) });
+}
+
+/// True iff the symlink at `link_path` resolves to the same canonicalized path
+/// as `expected_canon` (which the caller has ALREADY canonicalized). Mirrors
+/// `symlinkPointsAt` but takes a pre-canonicalized expected target so the caller
+/// can reuse it across several link checks.
+fn symlinkPointsAtCanon(c: *Context, link_path: []const u8, expected_canon: []const u8) !bool {
+    const cwd = std.Io.Dir.cwd();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = cwd.readLink(c.io, link_path, &buf) catch return false;
+    const link_dir = std.fs.path.dirname(link_path) orelse ".";
+    const canon_link_dir = try canonOrLexical(c, link_dir);
+    const lexical_target = try fsutil.resolveLinkTarget(c.arena, canon_link_dir, buf[0..n]);
+    const actual = try canonOrLexical(c, lexical_target);
+    return std.mem.eql(u8, actual, expected_canon);
 }

@@ -26,4 +26,5 @@ comptime {
     _ = @import("repository_test.zig");
     _ = @import("ops.zig");
     _ = @import("ops_test.zig");
+    _ = @import("promote_test.zig");
 }
