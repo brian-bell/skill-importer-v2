@@ -43,6 +43,30 @@ pub fn writeImportResult(w: *std.Io.Writer, r: types.ImportResult) std.Io.Writer
     try w.writeByte('\n');
 }
 
+/// Emit a repository import result (spec "JSON Schemas > Repository Import
+/// Result"). The result is a tagged union over `kind`; each variant struct
+/// carries the `kind` discriminator as its first field, so emitting the ACTIVE
+/// variant directly (not the union, which would wrap it in a `{"imported": ...}`
+/// envelope) yields the spec's flat shape:
+///   - imported:        {kind, skill_name, skill_path, manifest_path, manifest, actions}
+///   - selection:       {kind, repository, skills[{name, description?, relative_path}]}
+///   - imported_batch:  {kind, imports[{skill_name, ...}]}
+/// Absent optional fields (manifest source_location/source_repository,
+/// choice description) are omitted, not null. Ends in exactly one trailing
+/// newline (spec "Output Contract").
+pub fn writeRepositoryImportResult(w: *std.Io.Writer, r: types.RepositoryImportResult) std.Io.Writer.Error!void {
+    const opts: std.json.Stringify.Options = .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    };
+    switch (r) {
+        .imported => |v| try std.json.Stringify.value(v, opts, w),
+        .imported_batch => |v| try std.json.Stringify.value(v, opts, w),
+        .selection => |v| try std.json.Stringify.value(v, opts, w),
+    }
+    try w.writeByte('\n');
+}
+
 /// Write an enum value as its snake_case wire token (a bare JSON string).
 /// `std.json.Stringify` serializes a Zig enum as its `@tagName`, which is exactly
 /// the spec spelling for every domain enum.

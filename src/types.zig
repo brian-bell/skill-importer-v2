@@ -204,3 +204,52 @@ pub const RepositorySkillChoice = struct {
     description: ?[]const u8 = null,
     relative_path: []const u8,
 };
+
+/// A single repository import result (spec "Repository Import Result":
+/// `kind: "imported"`). Same fields as an `ImportResult`, with the `kind`
+/// discriminator FIRST so the JSON emits `kind` before the import fields. The
+/// manifest always carries `source_repository` for repository imports.
+pub const RepositorySingleImport = struct {
+    kind: RepoImportKind = .imported,
+    skill_name: []const u8,
+    skill_path: []const u8,
+    manifest_path: []const u8,
+    manifest: ImportManifest,
+    actions: []const ImportAction,
+};
+
+/// A repository selection result emitted when more than one valid skill exists
+/// and no `--select` was provided, WITHOUT writing storage (spec "Repository
+/// Import Result": `kind: "selection"`).
+pub const RepositorySelection = struct {
+    kind: RepoImportKind = .selection,
+    repository: []const u8,
+    skills: []const RepositorySkillChoice,
+};
+
+/// One imported skill inside a batch (spec "Repository Import Result":
+/// `imported_batch.imports[]`). Same fields as `ImportResult` (no per-import
+/// `kind`).
+pub const RepositoryBatchImport = struct {
+    skill_name: []const u8,
+    skill_path: []const u8,
+    manifest_path: []const u8,
+    manifest: ImportManifest,
+    actions: []const ImportAction,
+};
+
+/// A multi-skill batch import result (spec "Repository Import Result":
+/// `kind: "imported_batch"`).
+pub const RepositoryBatch = struct {
+    kind: RepoImportKind = .imported_batch,
+    imports: []const RepositoryBatchImport,
+};
+
+/// The repository import result (spec "Repository Import Result"): a tagged
+/// union over `RepoImportKind`. The JSON `kind` discriminator is carried by each
+/// variant struct so the wire shape matches the spec exactly.
+pub const RepositoryImportResult = union(RepoImportKind) {
+    imported: RepositorySingleImport,
+    imported_batch: RepositoryBatch,
+    selection: RepositorySelection,
+};

@@ -9,6 +9,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const result = @import("result.zig");
 const net = @import("net.zig");
+const git = @import("git.zig");
 
 const io = std.testing.io;
 
@@ -243,14 +244,18 @@ pub const IncrementingClock = struct {
 pub const FailingIo = struct {
     var vtable: std.Io.VTable = undefined;
     var orig_create: *const fn (?*anyopaque, std.Io.Dir, []const u8, std.Io.Dir.CreateFileOptions) std.Io.File.OpenError!std.Io.File = undefined;
+    var orig_create_atomic: *const fn (?*anyopaque, std.Io.Dir, []const u8, std.Io.Dir.CreateFileAtomicOptions) std.Io.Dir.CreateFileAtomicError!std.Io.File.Atomic = undefined;
     var fail_basename: []const u8 = "";
 
-    /// Build a failing IO that fails `dirCreateFile` for the given basename.
+    /// Build a failing IO that fails `dirCreateFile` AND `dirCreateFileAtomic`
+    /// (the latter backs `Dir.copyFile`) for the given destination basename.
     pub fn forBasename(basename: []const u8) std.Io {
         vtable = io.vtable.*;
         orig_create = vtable.dirCreateFile;
+        orig_create_atomic = vtable.dirCreateFileAtomic;
         fail_basename = basename;
         vtable.dirCreateFile = createFileOverride;
+        vtable.dirCreateFileAtomic = createFileAtomicOverride;
         return .{ .userdata = io.userdata, .vtable = &vtable };
     }
 
@@ -264,6 +269,18 @@ pub const FailingIo = struct {
             return error.AccessDenied;
         }
         return orig_create(ud, dir, sub_path, opts);
+    }
+
+    fn createFileAtomicOverride(
+        ud: ?*anyopaque,
+        dir: std.Io.Dir,
+        sub_path: []const u8,
+        opts: std.Io.Dir.CreateFileAtomicOptions,
+    ) std.Io.Dir.CreateFileAtomicError!std.Io.File.Atomic {
+        if (std.mem.eql(u8, std.fs.path.basename(sub_path), fail_basename)) {
+            return error.AccessDenied;
+        }
+        return orig_create_atomic(ud, dir, sub_path, opts);
     }
 };
 
@@ -290,22 +307,10 @@ pub const FakeFetcher = struct {
     }
 };
 
-/// Git/repository provider abstraction (struct of fn pointers) so repository
-/// import tests need no network or `git` binary (zig-clean-room-cli.md: fake git
-/// provider). `checkout` "checks out" a repo to a destination directory; the fake
-/// copies a prebuilt local tree.
-pub const Provider = struct {
-    /// Materialize `repository` into the empty directory at absolute `dest_path`,
-    /// or return a `result.ErrorKind` (git_unavailable/repository_error).
-    checkoutFn: *const fn (ctx: *anyopaque, repository: []const u8, dest_path: []const u8) CheckoutError!void,
-    ctx: *anyopaque,
-
-    pub const CheckoutError = error{ GitUnavailable, RepositoryError };
-
-    pub fn checkout(self: Provider, repository: []const u8, dest_path: []const u8) CheckoutError!void {
-        return self.checkoutFn(self.ctx, repository, dest_path);
-    }
-};
+/// Git/repository provider abstraction. The canonical interface lives in git.zig
+/// so the real (Child.run-backed) and fake providers share one type; re-exported
+/// here for test convenience (zig-clean-room-cli.md: fake git provider).
+pub const Provider = git.Provider;
 
 /// A fake provider that copies a prebuilt source tree (given as an absolute path)
 /// into the checkout destination, or returns a canned error.
