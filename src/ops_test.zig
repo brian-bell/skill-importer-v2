@@ -212,6 +212,36 @@ test "enable: promoted import links to canonical copy, not draft (spec enable)" 
     _ = r;
 }
 
+// --- enable: promoted import whose canonical copy was deleted out-of-band
+// (Finding #4). The draft import.json still says promoted=true, so discovery
+// reports source=imported, promoted=true and enable passes the not_promoted
+// check. But the canonical promoted copy <canonical>/<name> no longer exists on
+// disk, so creating the managed symlink would yield a DANGLING link reported as
+// a successful create_symlink. enable must PREFLIGHT that the link target is a
+// real directory and FAIL with an actionable error instead, creating no link. ---
+
+test "enable: promoted import with canonical copy missing fails, creates no broken symlink (Finding #4)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    // Promoted import: draft present + manifest promoted=true, but the canonical
+    // promoted copy was deleted out-of-band (never created here).
+    try h.fixtures().writeSkill("imports/orphan", "orphan", "Orphan.");
+    try h.fixtures().writeManifest("imports/orphan", .{
+        .source_type = .markdown,
+        .imported_at = 1710000000,
+        .content_hash = "sha256:x",
+        .promoted = true,
+    });
+    var c = h.ctx();
+
+    // enable must fail (the canonical target does not resolve to a real dir) and
+    // must NOT create a dangling symlink.
+    try expectErrKind(ops.enable(&c, "orphan", &.{.claude_code}), .unsupported_entry);
+
+    // No agent entry was created (no broken symlink left behind).
+    try testing.expectEqual(@as(?std.Io.File.Kind, null), try entryKind(&h, "claude/orphan"));
+}
+
 // --- enable into a PRE-EXISTING agent root (no spurious create_directory) ---
 
 test "enable: existing agent root, missing entry => only create_symlink (spec enable: create the agent root IF NEEDED)" {

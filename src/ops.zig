@@ -195,34 +195,24 @@ fn preflight(
     const kind = try fsutil.classify(c.io, cwd, link_path);
 
     switch (mode) {
-        .enable => switch (kind) {
-            .missing => {
-                const needs_root = !rootExists(c, agent_root);
-                return .{ .ok = .{
-                    .agent = agent,
-                    .kind = .create,
-                    .link_path = link_path,
-                    .target = canonical_target,
-                    .needs_root = needs_root,
+        .enable => {
+            // Preflight the LINK TARGET: the canonical promoted copy we are about
+            // to point at must exist as a real directory. A promoted import whose
+            // canonical copy was deleted out-of-band still reports promoted=true
+            // from its draft manifest (discovery), so it passes the not_promoted
+            // check above — but linking to the missing `<canonical>/<name>` would
+            // create a DANGLING symlink reported as a successful create
+            // (Finding #4). Refuse instead, leaving the agent entry untouched, so
+            // the operator can repair (e.g. re-promote) the canonical copy.
+            if (!try targetIsDirectory(c, canonical_target)) {
+                return .{ .err = .{
+                    .kind = .unsupported_entry,
+                    .name = dup(c, skill_name),
+                    .path = dup(c, canonical_target),
+                    .reason = "canonical promoted copy is missing or not a directory; re-promote the skill",
                 } };
-            },
-            .symlink => {
-                // Already the correct managed symlink => skip_unchanged; any other
-                // symlink target (external or WRONG managed target) is unsafe and
-                // is left untouched (spec "enable").
-                if (try symlinkPointsAt(c, link_path, canonical_target)) {
-                    return .{ .ok = .{
-                        .agent = agent,
-                        .kind = .skip,
-                        .link_path = link_path,
-                        .target = canonical_target,
-                        .needs_root = false,
-                    } };
-                }
-                return unsafe(c, link_path, agent);
-            },
-            // A real directory or regular file is unsafe (spec "enable").
-            .directory, .file => return unsafe(c, link_path, agent),
+            }
+            return enablePlan(c, skill_name, agent, kind, canonical_target);
         },
         .disable => switch (kind) {
             // Missing entry => nothing to remove (spec "disable": skip_unchanged).
@@ -261,6 +251,59 @@ fn preflight(
             .directory, .file => return unsafe(c, link_path, agent),
         },
     }
+}
+
+/// Build the enable action plan for one agent entry, given the entry kind and the
+/// validated canonical link target (spec "enable").
+fn enablePlan(
+    c: *Context,
+    skill_name: []const u8,
+    agent: types.Agent,
+    kind: fsutil.EntryKind,
+    canonical_target: []const u8,
+) anyerror!result.Result(AgentPlan) {
+    const agent_root = c.agentRoot(agent);
+    const link_path = try std.fs.path.join(c.arena, &.{ agent_root, skill_name });
+    switch (kind) {
+        .missing => {
+            const needs_root = !rootExists(c, agent_root);
+            return .{ .ok = .{
+                .agent = agent,
+                .kind = .create,
+                .link_path = link_path,
+                .target = canonical_target,
+                .needs_root = needs_root,
+            } };
+        },
+        .symlink => {
+            // Already the correct managed symlink => skip_unchanged; any other
+            // symlink target (external or WRONG managed target) is unsafe and
+            // is left untouched (spec "enable").
+            if (try symlinkPointsAt(c, link_path, canonical_target)) {
+                return .{ .ok = .{
+                    .agent = agent,
+                    .kind = .skip,
+                    .link_path = link_path,
+                    .target = canonical_target,
+                    .needs_root = false,
+                } };
+            }
+            return unsafe(c, link_path, agent);
+        },
+        // A real directory or regular file is unsafe (spec "enable").
+        .directory, .file => return unsafe(c, link_path, agent),
+    }
+}
+
+/// True iff `path` resolves (following symlinks) to a real directory. Used to
+/// preflight the enable link target so a missing/file canonical promoted copy
+/// fails instead of producing a dangling managed symlink (Finding #4).
+fn targetIsDirectory(c: *Context, path: []const u8) !bool {
+    const st = std.Io.Dir.cwd().statFile(c.io, path, .{ .follow_symlinks = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    return st.kind == .directory;
 }
 
 fn unsafe(c: *Context, link_path: []const u8, agent: types.Agent) result.Result(AgentPlan) {
