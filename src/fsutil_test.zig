@@ -51,6 +51,34 @@ test "classify: symlink to a real directory is classified as symlink, not direct
     try testing.expectEqual(fsutil.EntryKind.symlink, try fsutil.classify(io, roots.dir(), "claude/beta"));
 }
 
+// classify documents an else-branch: any entry whose stat kind is not a
+// directory, symlink, or regular file is reported as `.file` (fsutil.zig: the
+// `else => .file` arm). A FIFO (named pipe) is exactly such an entry. This locks
+// the documented behavior so a regression that, e.g., started returning
+// `.missing` or erroring for unexpected kinds would FAIL here. mkfifo is libc;
+// skip on platforms without it. Safety: the FIFO lives inside the temp tree.
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "classify: FIFO (non-file/non-dir/non-symlink) maps to .file per else-branch" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    try roots.makeRoot(.codex);
+
+    // Absolute, NUL-terminated path to the FIFO inside the isolated temp tree.
+    const abs = try std.fs.path.joinZ(testing.allocator, &.{ roots.base, "codex", "fifo" });
+    defer testing.allocator.free(abs);
+
+    if (mkfifo(abs.ptr, 0o600) != 0) return error.SkipZigTest;
+
+    // The else-branch of classify reports the FIFO's stat kind as `.file`.
+    try testing.expectEqual(
+        fsutil.EntryKind.file,
+        try fsutil.classify(io, roots.dir(), "codex/fifo"),
+    );
+}
+
 // --- resolveLinkTarget: lexical resolution via path.resolve, never realpath
 // (zig-clean-room-cli.md: "Resolve symlink targets lexically ... never
 // realpath"). ---

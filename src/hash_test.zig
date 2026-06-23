@@ -115,6 +115,97 @@ test "hashDirectory: relative path affects the digest" {
     try testing.expect(!std.mem.eql(u8, hf, hn));
 }
 
+// Golden for an EMPTY directory (zero regular files): the digest is the SHA-256
+// of nothing fed into the hash, i.e. equal to hashString(""), and must be stable
+// across runs with the "sha256:" prefix. Independently:
+//   printf '' | shasum -a 256
+test "hashDirectory: golden over an empty directory (zero regular files)" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+
+    try roots.dir().createDirPath(io, "empty-skill");
+    var d = try roots.dir().openDir(io, "empty-skill", .{ .iterate = true });
+    defer d.close(io);
+
+    const got = try hash.hashDirectory(testing.allocator, io, d);
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.startsWith(u8, got, "sha256:"));
+    try testing.expectEqualStrings(
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        got,
+    );
+}
+
+// Golden for a tree WITH subdirectories (multiple nesting levels). The digest is
+// stable and "sha256:"-prefixed. Fixture (sorted by '/'-normalized relpath):
+//   SKILL.md           = "root\n"  (5 bytes)
+//   a/one.txt          = "1"       (1 byte)
+//   a/b/two.txt        = "22"      (2 bytes)
+// Independently computed:
+//   printf 'SKILL.md\n5\nroot\na/b/two.txt\n2\n22a/one.txt\n1\n1' | shasum -a 256
+test "hashDirectory: golden over a tree with subdirectories is stable" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+
+    try fx.writeSupportFile("tree", "SKILL.md", "root\n");
+    try fx.writeSupportFile("tree/a", "one.txt", "1");
+    try fx.writeSupportFile("tree/a/b", "two.txt", "22");
+
+    var d = try roots.dir().openDir(io, "tree", .{ .iterate = true });
+    defer d.close(io);
+
+    const got = try hash.hashDirectory(testing.allocator, io, d);
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.startsWith(u8, got, "sha256:"));
+    try testing.expectEqualStrings(
+        "sha256:4fdf7892bfa51147e1f727d9f72c263125d4daf06078d0c2f7d80c34fd399964",
+        got,
+    );
+
+    // Re-hashing the same tree yields the identical digest (determinism).
+    var d2 = try roots.dir().openDir(io, "tree", .{ .iterate = true });
+    defer d2.close(io);
+    const got2 = try hash.hashDirectory(testing.allocator, io, d2);
+    defer testing.allocator.free(got2);
+    try testing.expectEqualStrings(got, got2);
+}
+
+// Read-path regression guard for trees WITH subdirectories. hashDirectory must
+// READ each file's bytes via the OS-native relative path (the walker entry path
+// using path.sep), NOT via the '/'-normalized string it uses for the hash
+// ENCODING. On a '\'-separator OS, reading by the normalized "a/b/two.txt" form
+// would fail with FileNotFound, while the encoding must still use '/'. This test
+// proves that nested files are actually read (their CONTENT is in the digest):
+// if the read path used the normalized form on a backslash OS this would error,
+// and on any OS, if nested content were silently skipped the two digests below
+// would be equal. They must differ because only the nested file's bytes change.
+test "hashDirectory: nested file content is read and folded into the digest" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+
+    // Two trees with identical structure/paths; only the DEEPLY NESTED file's
+    // bytes differ. The digests must differ, which can only happen if the nested
+    // file was opened and read (via its OS-native path) rather than skipped or
+    // mis-addressed.
+    try fx.writeSupportFile("rp1", "SKILL.md", "same");
+    try fx.writeSupportFile("rp1/deep/inner", "data.txt", "AAAA");
+    var d1 = try roots.dir().openDir(io, "rp1", .{ .iterate = true });
+    defer d1.close(io);
+    const h1 = try hash.hashDirectory(testing.allocator, io, d1);
+    defer testing.allocator.free(h1);
+
+    try fx.writeSupportFile("rp2", "SKILL.md", "same");
+    try fx.writeSupportFile("rp2/deep/inner", "data.txt", "BBBB");
+    var d2 = try roots.dir().openDir(io, "rp2", .{ .iterate = true });
+    defer d2.close(io);
+    const h2 = try hash.hashDirectory(testing.allocator, io, d2);
+    defer testing.allocator.free(h2);
+
+    try testing.expect(!std.mem.eql(u8, h1, h2));
+}
+
 // spec "import path": "Symlinks and unsupported filesystem entries are
 // rejected." The hash treats any non-dir/non-file entry as an error.
 test "hashDirectory: errors on a symlink entry" {

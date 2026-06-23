@@ -31,11 +31,23 @@ pub fn hashString(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
 /// entry (spec "import path": "Symlinks and unsupported filesystem entries are
 /// rejected."). Caller owns the result.
 pub fn hashDirectory(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]u8 {
-    // Collect '/'-normalized relative paths of every regular file.
-    var paths: std.ArrayList([]u8) = .empty;
+    // For each regular file keep TWO forms of its relative path:
+    //   - `native`: the walker's OS-native path (using the OS separator) — used
+    //     to OPEN/READ the bytes. On '\'-separator OSes this is the only form
+    //     the filesystem accepts.
+    //   - `normalized`: the same path with '\' rewritten to '/' — used ONLY in
+    //     the hash ENCODING so the digest is identical across separators.
+    // Reading by `normalized` would break on backslash OSes; keeping them
+    // separate fixes that (cli-clean-room-spec.md "import path": directory hash
+    // "includes supporting files and relative paths").
+    const RelFile = struct { native: []u8, normalized: []u8 };
+    var files: std.ArrayList(RelFile) = .empty;
     defer {
-        for (paths.items) |p| gpa.free(p);
-        paths.deinit(gpa);
+        for (files.items) |f| {
+            gpa.free(f.native);
+            gpa.free(f.normalized);
+        }
+        files.deinit(gpa);
     }
 
     var walker = try dir.walk(gpa);
@@ -44,26 +56,31 @@ pub fn hashDirectory(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]u8 
         switch (entry.kind) {
             .directory => {},
             .file => {
-                const rel = try normalizeSep(gpa, entry.path);
-                errdefer gpa.free(rel);
-                try paths.append(gpa, rel);
+                // `entry.path` is invalidated by the next walker step, so dupe.
+                const native = try gpa.dupe(u8, entry.path);
+                errdefer gpa.free(native);
+                const normalized = try normalizeSep(gpa, native);
+                errdefer gpa.free(normalized);
+                try files.append(gpa, .{ .native = native, .normalized = normalized });
             },
             else => return error.UnsupportedEntry,
         }
     }
 
-    std.mem.sort([]u8, paths.items, {}, struct {
-        fn lessThan(_: void, a: []u8, b: []u8) bool {
-            return std.mem.lessThan(u8, a, b);
+    // Sort by the '/'-normalized path so ordering is OS-independent.
+    std.mem.sort(RelFile, files.items, {}, struct {
+        fn lessThan(_: void, a: RelFile, b: RelFile) bool {
+            return std.mem.lessThan(u8, a.normalized, b.normalized);
         }
     }.lessThan);
 
     var h = Sha256.init(.{});
     var len_buf: [32]u8 = undefined;
-    for (paths.items) |rel| {
-        const content = try dir.readFileAlloc(io, rel, gpa, .unlimited);
+    for (files.items) |f| {
+        // Read bytes via the OS-native path; encode with the normalized path.
+        const content = try dir.readFileAlloc(io, f.native, gpa, .unlimited);
         defer gpa.free(content);
-        h.update(rel);
+        h.update(f.normalized);
         h.update("\n");
         const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{content.len}) catch unreachable;
         h.update(len_str);
