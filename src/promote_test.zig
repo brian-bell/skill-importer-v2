@@ -151,6 +151,59 @@ fn draft(h: *Harness, dir_name: []const u8, fm_name: []const u8, desc: []const u
 // promote
 // ===========================================================================
 
+// --- on-disk directory name differs from frontmatter name (Finding #7) ------
+// An imported draft discovered as `cool` (frontmatter name) lives in a directory
+// named `weird-import`. promote must read the import content from the REAL
+// on-disk dir `<imports>/weird-import`, not `<imports>/cool` (which does not
+// exist). Under the buggy code promote tries `<imports>/cool` and fails to find
+// the source. The canonical destination is still keyed by skill name.
+
+test "promote: imported draft whose dir name differs from frontmatter name promotes from the real dir (Finding #7)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    // On-disk dir `weird-import`, frontmatter name `cool` => discovered as `cool`.
+    try draft(&h, "weird-import", "cool", "Cool draft.");
+    try h.fixtures().writeSupportFile("imports/weird-import", "helper.txt", "support-data");
+    var c = h.ctx();
+
+    const r = try expectOk(ops.promote(&c, "cool", false));
+    try testing.expectEqualStrings("cool", r.skill_name);
+
+    // Canonical copy is keyed by skill name and carries the real content + support
+    // files copied from the on-disk import dir.
+    const skill = try readFile(&h, "canonical/cool/SKILL.md");
+    try testing.expect(std.mem.indexOf(u8, skill, "name: cool") != null);
+    try testing.expectEqualStrings("support-data", try readFile(&h, "canonical/cool/helper.txt"));
+
+    // The draft manifest in the REAL import dir is flipped to promoted=true.
+    const man = try readManifest(&h, "imports/weird-import");
+    try testing.expect(man.promoted);
+}
+
+test "unpromote: promoted import whose dir name differs from frontmatter name flips the real dir manifest (Finding #7)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    // On-disk import dir `weird-import` (frontmatter name `cool`), already promoted
+    // with a canonical copy at <canonical>/cool.
+    const rel = try std.fs.path.join(h.arena(), &.{ "imports", "weird-import" });
+    try h.fixtures().writeSkill(rel, "cool", "Cool draft.");
+    try h.fixtures().writeManifest(rel, .{
+        .source_type = .markdown,
+        .imported_at = 1710000000,
+        .content_hash = "sha256:x",
+        .promoted = true,
+    });
+    try h.fixtures().writeSkill("canonical/cool", "cool", "Cool promoted.");
+    var c = h.ctx();
+
+    _ = try expectOk(ops.unpromote(&c, "cool"));
+
+    // Canonical copy removed; the REAL import dir's manifest flipped to false.
+    try testing.expectEqual(@as(?std.Io.File.Kind, null), try entryKind(&h, "canonical/cool"));
+    const man = try readManifest(&h, "imports/weird-import");
+    try testing.expect(!man.promoted);
+}
+
 // --- error paths -----------------------------------------------------------
 
 test "promote: unknown skill fails (spec promote: Unknown skills fail.)" {

@@ -127,6 +127,43 @@ test "enable: unpromoted import fails (spec enable: Unpromoted imports fail.)" {
     try expectErrKind(ops.enable(&c, "draft", &.{.claude_code}), .not_promoted);
 }
 
+// --- on-disk directory name differs from frontmatter name (Finding #7) ------
+// A canonical skill discovered as `cool` (frontmatter name) lives in a directory
+// named `weird-dir`. enable must symlink to the REAL on-disk directory
+// `<canonical>/weird-dir`, not `<canonical>/cool` (which does not exist).
+// A symlink to a non-existent target is a dangling/broken link reported as
+// success — the bug. The fix resolves the target from the on-disk directory.
+
+test "enable: canonical skill whose dir name differs from frontmatter name links to the real dir (Finding #7)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    // On-disk dir `weird-dir`, frontmatter name `cool` => discovered as `cool`.
+    try h.fixtures().writeSkill("canonical/weird-dir", "cool", "Cool.");
+    var c = h.ctx();
+
+    const r = try expectOk(ops.enable(&c, "cool", &.{.claude_code}));
+
+    // The managed symlink lives at <claude>/cool (keyed by skill name) but must
+    // TARGET the real on-disk dir <canonical>/weird-dir.
+    const target = try linkTarget(&h, "claude/cool");
+    try testing.expectEqualStrings(try canonicalPath(&h, "weird-dir"), target);
+    // The recorded create_symlink action target matches.
+    try testing.expectEqual(types.SkillActionKind.create_symlink, r.actions[r.actions.len - 1].action);
+    try testing.expectEqualStrings(try canonicalPath(&h, "weird-dir"), r.actions[r.actions.len - 1].target.?);
+
+    // Crucially the link resolves to a REAL directory (not dangling): following
+    // it must reach the SKILL.md that we wrote.
+    const followed = try h.roots.dir().statFile(io, "claude/cool", .{ .follow_symlinks = true });
+    try testing.expect(followed.kind == .directory);
+    const md = try readFileVia(&h, "claude/cool/SKILL.md");
+    try testing.expect(std.mem.indexOf(u8, md, "name: cool") != null);
+}
+
+/// Read a file `rel` (following symlinks) under the temp base into the arena.
+fn readFileVia(h: *Harness, rel: []const u8) ![]u8 {
+    return h.roots.dir().readFileAlloc(io, rel, h.arena(), .unlimited);
+}
+
 // --- enable missing -> create root + symlink to canonical copy -------------
 
 test "enable: missing entry creates agent root + symlink to canonical copy (spec enable)" {

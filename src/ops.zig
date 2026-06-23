@@ -97,9 +97,12 @@ fn runImpl(c: *Context, skill_name: []const u8, agents: []const types.Agent, mod
     const deduped = try dedupeAgents(c.arena, agents);
 
     // The canonical promoted copy is the managed symlink target for enable, and
-    // the "correct" target for a canonical/promoted skill on disable.
-    const canonical_target = try std.fs.path.join(c.arena, &.{ c.canonical_root, skill_name });
-    const imports_target = try std.fs.path.join(c.arena, &.{ c.imports_root, skill_name });
+    // the "correct" target for a canonical/promoted skill on disable. Resolve the
+    // path from the ON-DISK directory name, which may differ from the frontmatter
+    // skill name (Finding #7); fall back to the skill name when the skill is not
+    // present in that root.
+    const canonical_target = try std.fs.path.join(c.arena, &.{ c.canonical_root, entry.canonical_dir orelse skill_name });
+    const imports_target = try std.fs.path.join(c.arena, &.{ c.imports_root, entry.imports_dir orelse skill_name });
 
     // 3. PREFLIGHT every requested agent (spec "Filesystem Safety": preflight all
     // before mutating any). A single unsafe entry fails the whole operation,
@@ -130,6 +133,10 @@ fn runImpl(c: *Context, skill_name: []const u8, agents: []const types.Agent, mod
 const Resolved = struct {
     source: types.SkillSource,
     promoted: bool,
+    /// On-disk dir name in the canonical / imports root (Finding #7); may differ
+    /// from `skill_name`. Null when the skill is not present in that root.
+    canonical_dir: ?[]const u8,
+    imports_dir: ?[]const u8,
 };
 
 /// Resolve a skill by name via discovery (spec enable/disable: a skill must be
@@ -141,7 +148,12 @@ fn resolve(c: *Context, skill_name: []const u8) result.Result(Resolved) {
     };
     for (inv.skills) |s| {
         if (std.mem.eql(u8, s.name, skill_name)) {
-            return .{ .ok = .{ .source = s.source, .promoted = s.promoted } };
+            return .{ .ok = .{
+                .source = s.source,
+                .promoted = s.promoted,
+                .canonical_dir = s.canonical_dir,
+                .imports_dir = s.imports_dir,
+            } };
         }
     }
     return .{ .err = .{ .kind = .unknown_skill, .name = dup(c, skill_name) } };
@@ -434,7 +446,10 @@ fn promoteRun(c: *Context, skill_name: []const u8, overwrite: bool) anyerror!Res
         },
     }
 
-    const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, skill_name });
+    // The import source is the REAL on-disk directory (may differ from the
+    // frontmatter skill name, Finding #7); the canonical destination is keyed by
+    // skill name (spec promote: copied to `<canonical>/<skill-name>`).
+    const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, entry.imports_dir orelse skill_name });
     const dest_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, skill_name });
 
     // 2a. Existing canonical destination: fail without --overwrite (spec promote +
@@ -616,8 +631,11 @@ fn unpromoteRun(c: *Context, skill_name: []const u8) anyerror!Result {
         },
     }
 
-    const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, skill_name });
-    const dest_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, skill_name });
+    // The import source (manifest to flip) and the canonical copy to remove are
+    // resolved from the REAL on-disk directory names, which may differ from the
+    // frontmatter skill name (Finding #7).
+    const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, entry.imports_dir orelse skill_name });
+    const dest_dir = try std.fs.path.join(c.arena, &.{ c.canonical_root, entry.canonical_dir orelse skill_name });
 
     // Execute; on an execute-phase I/O error report the completed actions (spec
     // "Filesystem Safety").
@@ -701,7 +719,9 @@ fn deleteRun(c: *Context, skill_name: []const u8) anyerror!Result {
         return .{ .err = .{ .kind = .enabled_import, .name = dup(c, skill_name) } };
     }
 
-    const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, skill_name });
+    // The draft to delete is the REAL on-disk directory, which may differ from
+    // the frontmatter skill name (Finding #7).
+    const import_dir = try std.fs.path.join(c.arena, &.{ c.imports_root, entry.imports_dir orelse skill_name });
 
     // Execute; on an execute-phase I/O error report whatever completed (spec
     // "Filesystem Safety"). The single remove_directory action is appended only

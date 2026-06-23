@@ -28,6 +28,9 @@ pub const Roots = struct {
 };
 
 /// Per-skill accumulator while merging across roots. Keyed by skill name.
+/// `canonical_dir`/`imports_dir` are the ON-DISK directory names this skill
+/// occupies in the canonical / imports root, which may differ from the
+/// frontmatter `name` (Finding #7); ops resolves real paths from these.
 const Merged = struct {
     name: []const u8,
     description: ?[]const u8 = null,
@@ -36,6 +39,8 @@ const Merged = struct {
     promoted: bool = false,
     claude: types.AgentEntryStatus = .missing,
     codex: types.AgentEntryStatus = .missing,
+    canonical_dir: ?[]const u8 = null,
+    imports_dir: ?[]const u8 = null,
 };
 
 /// Discover the full inventory. All returned strings/slices are owned by `arena`.
@@ -66,6 +71,9 @@ fn discoverImpl(arena: std.mem.Allocator, io: std.Io, roots: Roots) anyerror!res
                 const m = try getOrPut(arena, &map, md.name);
                 m.source = .canonical;
                 if (m.description == null) m.description = md.description;
+                // Record the ON-DISK directory name (may differ from md.name) so
+                // ops resolves the real `<canonical>/<dir>` path (Finding #7).
+                if (m.canonical_dir == null) m.canonical_dir = try arena.dupe(u8, entry.name);
             }
         }
     }
@@ -84,6 +92,9 @@ fn discoverImpl(arena: std.mem.Allocator, io: std.Io, roots: Roots) anyerror!res
                 // imported takes precedence over canonical (canonical < imported).
                 m.source = .imported;
                 if (m.description == null) m.description = md.description;
+                // Record the ON-DISK directory name (may differ from md.name) so
+                // ops resolves the real `<imports>/<dir>` path (Finding #7).
+                if (m.imports_dir == null) m.imports_dir = try arena.dupe(u8, entry.name);
 
                 // Optional import.json; malformed => discovery failure (spec "list").
                 const man = readManifest(arena, io, d.*, entry.name) catch {
@@ -132,6 +143,8 @@ fn discoverImpl(arena: std.mem.Allocator, io: std.Io, roots: Roots) anyerror!res
                 .claude_code = m.claude,
                 .codex = m.codex,
             },
+            .canonical_dir = m.canonical_dir,
+            .imports_dir = m.imports_dir,
         });
     }
 

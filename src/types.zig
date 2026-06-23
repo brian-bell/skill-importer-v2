@@ -167,6 +167,16 @@ pub const AgentEntries = struct {
 };
 
 /// One skill in the inventory (spec "Inventory": `skills[]`).
+///
+/// `canonical_dir`/`imports_dir` record the ON-DISK directory name a skill
+/// occupies in the canonical / imports root, which may DIFFER from the
+/// frontmatter `name` (a directory `weird-dir` whose SKILL.md says `name: cool`
+/// is discovered as skill `cool`). enable/disable/promote/unpromote must resolve
+/// the real on-disk path from these, not from the frontmatter name, otherwise a
+/// managed symlink targets a non-existent `<root>/<name>` (Finding #7). These two
+/// fields are internal bookkeeping, NOT part of the spec "Inventory" wire shape,
+/// so the custom `jsonStringify` below omits them and emits exactly the spec
+/// fields in declaration order.
 pub const SkillEntry = struct {
     name: []const u8,
     description: ?[]const u8 = null,
@@ -175,6 +185,37 @@ pub const SkillEntry = struct {
     promoted: bool,
     enablement: Enablement,
     agent_entries: AgentEntries,
+    /// On-disk directory name in the canonical root (null if not present there).
+    canonical_dir: ?[]const u8 = null,
+    /// On-disk directory name in the imports root (null if not present there).
+    imports_dir: ?[]const u8 = null,
+
+    /// Emit exactly the spec "Inventory" `skills[]` fields (omitting the internal
+    /// `canonical_dir`/`imports_dir`), honoring `emit_null_optional_fields` for
+    /// the optional `description`/`source_repository` keys (spec "Inventory":
+    /// those keys appear only when present).
+    pub fn jsonStringify(self: SkillEntry, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (!(jw.options.emit_null_optional_fields == false and self.description == null)) {
+            try jw.objectField("description");
+            try jw.write(self.description);
+        }
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (!(jw.options.emit_null_optional_fields == false and self.source_repository == null)) {
+            try jw.objectField("source_repository");
+            try jw.write(self.source_repository);
+        }
+        try jw.objectField("promoted");
+        try jw.write(self.promoted);
+        try jw.objectField("enablement");
+        try jw.write(self.enablement);
+        try jw.objectField("agent_entries");
+        try jw.write(self.agent_entries);
+        try jw.endObject();
+    }
 };
 
 /// One entry inside a grouped `source_repositories[].skills[]` (spec
