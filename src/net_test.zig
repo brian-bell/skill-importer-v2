@@ -155,11 +155,115 @@ test "fetchWithDeadline returns Timeout when the server does not respond in time
 
     // On timeout the worker thread is detached and keeps running (best-effort;
     // zig-clean-room-cli.md "Risks": the socket may linger past the deadline).
-    // Use page_allocator for the fetch so the abandoned in-flight worker — which
-    // frees its own allocations only after it eventually completes — does not
-    // trip the leak detector that std.testing.allocator runs at test end.
-    const gpa = std.heap.page_allocator;
-    try testing.expectError(error.Timeout, net.fetchWithDeadline(io, gpa, u, 1));
+    // The worker owns its own Io.Threaded and uses the worker-lifetime allocator
+    // (page_allocator here) for the job and its body, freeing them itself when it
+    // eventually completes — so the abandoned worker never touches the caller's
+    // wait Io nor the result allocator.
+    const worker_gpa = std.heap.page_allocator;
+    var wait_threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer wait_threaded.deinit();
+    const wait_io = wait_threaded.io();
+    try testing.expectError(error.Timeout, net.fetchWithDeadline(
+        wait_io,
+        worker_gpa,
+        testing.allocator,
+        u,
+        1,
+        net.fetchOnce,
+    ));
+}
+
+// --- UAF regression (findings #1/#2/#6): on timeout, NO detached worker may
+// read or write any memory owned by the caller's wait Io or by the result
+// allocator (the per-op arena in production). This test drives the timeout path
+// with a fully deterministic blocking fetch and then releases the worker only
+// AFTER the caller has returned AND torn down the wait Io + result allocator,
+// asserting the worker self-frees with no UAF/double-free under the testing
+// allocator. ---
+
+/// Test-controlled blocking fetch. It blocks on `block_event` (settled by the
+/// test thread) so the deadline deterministically fires first; on release it
+/// allocates a body with the worker-lifetime allocator handed to it (proving the
+/// worker uses neither the caller's wait Io nor the result allocator) and returns
+/// it (the worker frees it on completion since the caller already timed out).
+const BlockingFetch = struct {
+    /// Set by the worker (under its own owned Io) so the test can confirm the
+    /// worker reached the blocking point before the test releases it.
+    var entered: std.atomic.Value(bool) = .init(false);
+    /// Settled by the test thread to release the blocked worker.
+    var release: std.atomic.Value(bool) = .init(false);
+    /// Set true by the worker just before it returns, proving it self-completed
+    /// without the caller present.
+    var completed: std.atomic.Value(bool) = .init(false);
+
+    fn fetch(worker_io: std.Io, worker_gpa: std.mem.Allocator, url: []const u8) net.Fetcher.FetchError![]u8 {
+        _ = worker_io;
+        entered.store(true, .release);
+        // Busy-wait until the test releases us. This runs on the detached worker
+        // thread; by the time `release` is true the caller has long since
+        // returned and torn down its wait Io + result allocator.
+        while (!release.load(.acquire)) {
+            std.atomic.spinLoopHint();
+        }
+        const body = try worker_gpa.dupe(u8, url);
+        completed.store(true, .release);
+        return body;
+    }
+};
+
+test "fetchWithDeadline: detached worker self-frees after caller tears down (no UAF)" {
+    BlockingFetch.entered.store(false, .release);
+    BlockingFetch.release.store(false, .release);
+    BlockingFetch.completed.store(false, .release);
+
+    // The worker's job + body come from this checked allocator. If the detached
+    // worker double-frees or the caller frees worker memory, the testing
+    // allocator flags it; if the worker leaks, the leak check at scope end fires.
+    var worker_gpa_state: std.heap.DebugAllocator(.{}) = .{};
+    const worker_gpa = worker_gpa_state.allocator();
+
+    {
+        // The caller's wait Io and result allocator live ONLY in this block. The
+        // worker must touch neither after the caller returns; we tear them down
+        // here while the worker is still blocked, then release the worker.
+        var wait_threaded: std.Io.Threaded = .init(testing.allocator, .{});
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        const wait_io = wait_threaded.io();
+        const result_gpa = arena_state.allocator();
+
+        const err = net.fetchWithDeadline(
+            wait_io,
+            worker_gpa,
+            result_gpa,
+            "http://blocked.example/skill.md",
+            1,
+            BlockingFetch.fetch,
+        );
+        try testing.expectError(error.Timeout, err);
+        // The worker must have reached its blocking point before we tear down.
+        try testing.expect(BlockingFetch.entered.load(.acquire));
+
+        // Tear down the caller-owned wait Io and result allocator while the
+        // worker is STILL running and blocked. If the worker referenced either,
+        // its later completion would corrupt freed memory.
+        arena_state.deinit();
+        wait_threaded.deinit();
+    }
+
+    // Now release the detached worker. It must complete using only worker-owned
+    // resources (its own Io.Threaded + worker_gpa), freeing them itself.
+    BlockingFetch.release.store(true, .release);
+    while (!BlockingFetch.completed.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+    // Give the worker a moment to run its self-free tail after setting completed.
+    var spins: usize = 0;
+    while (spins < 1_000_000) : (spins += 1) std.atomic.spinLoopHint();
+
+    // No leak/double-free: the worker freed its own job + body. detectLeaks
+    // returns the number of leaked allocations (0 == clean).
+    try testing.expectEqual(@as(usize, 0), worker_gpa_state.detectLeaks());
+    try testing.expectEqual(std.heap.Check.ok, worker_gpa_state.deinit());
 }
 
 // --- connection failure (spec "import url": "On fetch ... failure"). Nothing
