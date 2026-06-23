@@ -708,3 +708,288 @@ test "import repository: bad repository -> exit 1 with repository-named stderr" 
     try testing.expect(std.mem.indexOf(u8, run.stderr, "skill-importer:") != null);
     try testing.expect(std.mem.indexOf(u8, run.stderr, bogus) != null);
 }
+
+// === H8 hardening: gaps flagged by adversarial review ========================
+
+/// Return true if `<imports-root>/<name>` exists as a directory entry. Used to
+/// prove selection results write NO storage and that delete removes storage.
+/// SAFETY: only ever called with the disposable `tr.imports` path.
+fn importDirExists(arena: std.mem.Allocator, tr: *tu.TmpRoots, name: []const u8) !bool {
+    const rel = try std.fs.path.join(arena, &.{ "imports", name });
+    tr.dir().access(io, rel, .{}) catch return false;
+    return true;
+}
+
+// spec "import repository": a selection result is returned "without writing
+// storage". The existing selection test asserts kind=selection + exit 0 but NOT
+// the no-storage guarantee — a regression that eagerly imported the first skill
+// would still pass it. This locks the spec's "without writing storage" clause by
+// asserting the imports root contains neither candidate skill after a selection.
+test "import repository selection: writes NO storage to imports root" {
+    const gpa = testing.allocator;
+    var tr = try tu.TmpRoots.init(gpa);
+    defer tr.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    const repo = try makeGitRepo(gpa, arena, &tr, "repo", &.{
+        .{ "skill-a", "alpha", "Alpha skill." },
+        .{ "skill-b", "beta", "Beta skill." },
+    });
+
+    const argv = try concat(arena, &.{ "--format", "json" }, try concat(arena, try rootArgs(arena, &tr), &.{ "import", "repository", "--repository", repo }));
+    var run = try runCliWithPath(gpa, argv);
+    defer run.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 0), run.code);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, run.stdout, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("selection", parsed.value.object.get("kind").?.string);
+
+    // No storage was written for either candidate (spec: selection returns
+    // "without writing storage").
+    try testing.expect(!try importDirExists(arena, &tr, "alpha"));
+    try testing.expect(!try importDirExists(arena, &tr, "beta"));
+}
+
+// spec "Output Contract" exit codes: "Command parse error ... return a non-zero
+// exit code." Existing parse-error tests only assert `skill-importer:` is in
+// stderr, which any error kind satisfies. This pins the failure to the
+// PARSE-ERROR kind specifically: `kindMessage(.parse_error)` is the unique
+// string "invalid command line" (main.zig), so its presence proves the error was
+// routed as a parse error and not, e.g., misclassified as a discovery/io error.
+test "parse error: unknown command stderr is specifically the parse-error kind" {
+    const gpa = testing.allocator;
+    var run = try runCli(gpa, &.{"frobnicate"});
+    defer run.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), run.code);
+    try testing.expect(std.mem.indexOf(u8, run.stderr, "invalid command line") != null);
+}
+
+// Same, for a missing required option: `import path` without `--path` must be a
+// PARSE error (the unique "invalid command line" message), not a downstream
+// import/io error.
+test "parse error: missing --path is specifically the parse-error kind" {
+    const gpa = testing.allocator;
+    var run = try runCli(gpa, &.{ "import", "path" });
+    defer run.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), run.code);
+    try testing.expect(std.mem.indexOf(u8, run.stderr, "invalid command line") != null);
+}
+
+// spec "Output Contract": text output is human-only but must share exit status
+// and not crash. The `textImport` renderer (import success TEXT) was never
+// exercised end-to-end — only JSON import and text *selection* were. This drives
+// `textImport` through the built binary: a successful `import path` in text
+// format must exit 0 and print the skill name without crashing.
+test "import path text: textImport renderer runs without crashing, exit 0" {
+    const gpa = testing.allocator;
+    var tr = try tu.TmpRoots.init(gpa);
+    defer tr.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    try tr.dir().createDirPath(io, "src");
+    {
+        const f = try tr.dir().createFile(io, "src/SKILL.md", .{});
+        defer f.close(io);
+        var wbuf: [256]u8 = undefined;
+        var fw = f.writer(io, &wbuf);
+        try fw.interface.writeAll("---\nname: txtimp\ndescription: text import\n---\nbody\n");
+        try fw.interface.flush();
+    }
+    const src_md = try std.fs.path.join(arena, &.{ tr.base, "src/SKILL.md" });
+
+    // No --format: defaults to text (spec: Format defaults to text).
+    const argv = try concat(arena, try rootArgs(arena, &tr), &.{ "import", "path", "--path", src_md });
+    var run = try runCli(gpa, argv);
+    defer run.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), run.code);
+    try testing.expect(std.mem.indexOf(u8, run.stdout, "txtimp") != null);
+    try testing.expect(run.stdout[run.stdout.len - 1] == '\n');
+}
+
+// spec "Output Contract": the `textOperation` renderer (enable/disable/promote/
+// unpromote/delete success in TEXT) was never driven e2e. A successful `promote`
+// in text format must run `textOperation` without crashing and exit 0.
+test "promote text: textOperation renderer runs without crashing, exit 0" {
+    const gpa = testing.allocator;
+    var tr = try tu.TmpRoots.init(gpa);
+    defer tr.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    {
+        const script = try std.fmt.allocPrint(
+            arena,
+            "printf '%s\\n' '---' 'name: txtop' 'description: o' '---' 'body' | '{s}' --canonical-root {s} --imports-root {s} --claude-code-root {s} --codex-root {s} import markdown",
+            .{ build_options.exe_path, tr.canonical, tr.imports, tr.claude, tr.codex },
+        );
+        var run = try runShell(gpa, script);
+        defer run.deinit(gpa);
+        try testing.expectEqual(@as(u8, 0), run.code);
+    }
+
+    // promote in TEXT format (no --format).
+    const argv = try concat(arena, try rootArgs(arena, &tr), &.{ "promote", "--skill", "txtop" });
+    var run = try runCli(gpa, argv);
+    defer run.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), run.code);
+    try testing.expect(std.mem.indexOf(u8, run.stdout, "txtop") != null);
+    try testing.expect(run.stdout[run.stdout.len - 1] == '\n');
+}
+
+// spec "import repository": the `textRepository` `.imported` branch (single
+// repository import, TEXT) was never driven e2e — only the selection branch was.
+// A single-skill repository imported in text format must run `textRepository`
+// without crashing and exit 0.
+test "import repository single text: textRepository imported branch, exit 0" {
+    const gpa = testing.allocator;
+    var tr = try tu.TmpRoots.init(gpa);
+    defer tr.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    const repo = try makeGitRepo(gpa, arena, &tr, "repo", &.{
+        .{ "only", "solotext", "The only skill." },
+    });
+
+    const argv = try concat(arena, try rootArgs(arena, &tr), &.{ "import", "repository", "--repository", repo });
+    var run = try runCliWithPath(gpa, argv);
+    defer run.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), run.code);
+    try testing.expect(std.mem.indexOf(u8, run.stdout, "solotext") != null);
+    try testing.expect(run.stdout[run.stdout.len - 1] == '\n');
+}
+
+// spec "Output Contract": "Successful JSON output must be ... terminated by a
+// newline." main.zig renders stdout through a fixed 4096-byte buffer and relies
+// on a single `flush()` before exit (Writergate flush-before-exit). If the
+// buffer ever drained mid-write without a final flush, an output LARGER than the
+// buffer could be truncated or double-/un-terminated. This builds an inventory
+// whose `list --format json` exceeds 4096 bytes (many imported skills with long
+// descriptions) and asserts the output is valid JSON ending in EXACTLY one
+// trailing newline — proving flush correctness across the buffer boundary.
+test "list json larger than 4096-byte stdout buffer ends in exactly one newline" {
+    const gpa = testing.allocator;
+    var tr = try tu.TmpRoots.init(gpa);
+    defer tr.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    // Seed enough canonical skills (each with a long description) that the
+    // pretty-printed JSON inventory is well over 4096 bytes.
+    var fx = tu.Fixtures.init(&tr);
+    const long_desc = "x" ** 200;
+    var n: usize = 0;
+    while (n < 40) : (n += 1) {
+        const dir_name = try std.fmt.allocPrint(arena, "canonical/skill-{d:0>3}", .{n});
+        const skill_name = try std.fmt.allocPrint(arena, "skill-{d:0>3}", .{n});
+        try fx.writeSkill(dir_name, skill_name, long_desc);
+    }
+
+    const argv = try concat(arena, &.{ "--format", "json" }, try concat(arena, try rootArgs(arena, &tr), &.{"list"}));
+    var run = try runCli(gpa, argv);
+    defer run.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 0), run.code);
+    // The output must be larger than the 4096-byte stdout buffer for this test
+    // to actually exercise a buffer-spanning flush.
+    try testing.expect(run.stdout.len > 4096);
+    try testing.expect(std.unicode.utf8ValidateSlice(run.stdout));
+    // Exactly one trailing newline (flush correctness across the boundary).
+    try testing.expect(run.stdout[run.stdout.len - 1] == '\n');
+    try testing.expect(run.stdout[run.stdout.len - 2] != '\n');
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, run.stdout, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 40), parsed.value.object.get("skills").?.array.items.len);
+}
+
+// spec "Commands": the full managed-skill lifecycle, end-to-end through the built
+// binary, in ONE test: import (stdin markdown) -> promote -> enable -> disable ->
+// unpromote -> delete. Each mutating step asserts exit 0, valid UTF-8 JSON with
+// EXACTLY one trailing newline, and the correct renderer wiring (skill_name +
+// actions array for operations). The final `delete` is asserted to actually
+// remove `<imports-root>/<skill>` (spec "delete": "removes
+// <imports-root>/<skill-name>"). No real user root is touched (disposable roots,
+// no HOME).
+test "end-to-end lifecycle: import->promote->enable->disable->unpromote->delete (json)" {
+    const gpa = testing.allocator;
+    var tr = try tu.TmpRoots.init(gpa);
+    defer tr.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    // Asserts one JSON operation result: exit 0, UTF-8, exactly one trailing
+    // newline, skill_name matches, actions is an array.
+    const Checker = struct {
+        fn op(g: std.mem.Allocator, run: *Run, name: []const u8) !void {
+            try testing.expectEqual(@as(u8, 0), run.code);
+            try testing.expect(std.unicode.utf8ValidateSlice(run.stdout));
+            try testing.expect(run.stdout.len > 0 and run.stdout[run.stdout.len - 1] == '\n');
+            try testing.expect(run.stdout[run.stdout.len - 2] != '\n');
+            const parsed = try std.json.parseFromSlice(std.json.Value, g, run.stdout, .{});
+            defer parsed.deinit();
+            try testing.expectEqualStrings(name, parsed.value.object.get("skill_name").?.string);
+            try testing.expect(parsed.value.object.get("actions").? == .array);
+        }
+    };
+
+    // 1. import markdown (stdin) — exit 0, trailing newline.
+    {
+        const script = try std.fmt.allocPrint(
+            arena,
+            "printf '%s\\n' '---' 'name: life' 'description: lifecycle' '---' 'body' | '{s}' --format json --canonical-root {s} --imports-root {s} --claude-code-root {s} --codex-root {s} import markdown",
+            .{ build_options.exe_path, tr.canonical, tr.imports, tr.claude, tr.codex },
+        );
+        var run = try runShell(gpa, script);
+        defer run.deinit(gpa);
+        try testing.expectEqual(@as(u8, 0), run.code);
+        try testing.expect(run.stdout[run.stdout.len - 1] == '\n');
+        try testing.expect(run.stdout[run.stdout.len - 2] != '\n');
+        try testing.expect(try importDirExists(arena, &tr, "life"));
+    }
+    // 2. promote
+    {
+        const argv = try concat(arena, &.{ "--format", "json" }, try concat(arena, try rootArgs(arena, &tr), &.{ "promote", "--skill", "life" }));
+        var run = try runCli(gpa, argv);
+        defer run.deinit(gpa);
+        try Checker.op(gpa, &run, "life");
+    }
+    // 3. enable (both agents)
+    {
+        const argv = try concat(arena, &.{ "--format", "json" }, try concat(arena, try rootArgs(arena, &tr), &.{ "enable", "--skill", "life", "--agent", "claude-code", "--agent", "codex" }));
+        var run = try runCli(gpa, argv);
+        defer run.deinit(gpa);
+        try Checker.op(gpa, &run, "life");
+    }
+    // 4. disable (both agents)
+    {
+        const argv = try concat(arena, &.{ "--format", "json" }, try concat(arena, try rootArgs(arena, &tr), &.{ "disable", "--skill", "life", "--agent", "claude-code", "--agent", "codex" }));
+        var run = try runCli(gpa, argv);
+        defer run.deinit(gpa);
+        try Checker.op(gpa, &run, "life");
+    }
+    // 5. unpromote (now no managed symlinks remain; removes canonical copy)
+    {
+        const argv = try concat(arena, &.{ "--format", "json" }, try concat(arena, try rootArgs(arena, &tr), &.{ "unpromote", "--skill", "life" }));
+        var run = try runCli(gpa, argv);
+        defer run.deinit(gpa);
+        try Checker.op(gpa, &run, "life");
+    }
+    // 6. delete — succeeds (unpromoted, not enabled) and removes the import dir.
+    {
+        const argv = try concat(arena, &.{ "--format", "json" }, try concat(arena, try rootArgs(arena, &tr), &.{ "delete", "--skill", "life" }));
+        var run = try runCli(gpa, argv);
+        defer run.deinit(gpa);
+        try Checker.op(gpa, &run, "life");
+        // spec "delete": successful deletion removes <imports-root>/<skill-name>.
+        try testing.expect(!try importDirExists(arena, &tr, "life"));
+    }
+}
