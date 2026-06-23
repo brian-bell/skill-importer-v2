@@ -494,8 +494,13 @@ fn copyDirRecording(
     rel: []const u8,
     actions: *std.ArrayList(types.ImportAction),
 ) !void {
-    var it = src.iterate();
-    while (try it.next(c.io)) |entry| {
+    // Collect entries, then sort by name, so the recorded copy_file actions are
+    // emitted in a DETERMINISTIC order rather than filesystem readdir order
+    // (Finding #13; spec "Output Contract": deterministic output — the
+    // content_hash already sorts by relative path). Entry names are invalidated
+    // by the next iteration step, so dupe each into the arena.
+    const entries = try collectSortedEntries(c, src);
+    for (entries) |entry| {
         // Exclude version-control metadata (`.git`) from the copy so the imported
         // skill never carries a clone's `.git` directory/symlink, matching the
         // content_hash which also excludes it (spec "import repository";
@@ -519,6 +524,26 @@ fn copyDirRecording(
             else => return error.UnsupportedEntry,
         }
     }
+}
+
+/// A directory entry whose `name` is owned by the arena (stable across iteration).
+const SortedEntry = struct { name: []const u8, kind: std.Io.File.Kind };
+
+/// Read every entry of `src` into an arena-owned slice sorted ascending by name,
+/// so directory traversal is deterministic (Finding #13).
+fn collectSortedEntries(c: *Context, src: std.Io.Dir) ![]SortedEntry {
+    var list: std.ArrayList(SortedEntry) = .empty;
+    var it = src.iterate();
+    while (try it.next(c.io)) |entry| {
+        try list.append(c.arena, .{ .name = try c.arena.dupe(u8, entry.name), .kind = entry.kind });
+    }
+    const items = try list.toOwnedSlice(c.arena);
+    std.mem.sort(SortedEntry, items, {}, struct {
+        fn lessThan(_: void, a: SortedEntry, b: SortedEntry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+    return items;
 }
 
 fn joinRel(c: *Context, base: []const u8, rel: []const u8, name: []const u8) ![]const u8 {

@@ -223,6 +223,103 @@ test "import markdown rolls back and leaves no skill directory on a store failur
     try testing.expect(!h.importsExists("alpha/import.json"));
 }
 
+// --- Finding #13: directory / repository imports must emit copy_file actions in
+// a DETERMINISTIC order, not raw readdir order, matching the deterministic-output
+// requirement (spec "Output Contract": deterministic; "import path": the
+// directory content hash sorts relative paths). copyDirRecording iterated in
+// filesystem order; this asserts the recorded copy_file action paths come out
+// sorted ascending (by name within each directory level). The fixture writes
+// supporting files in a deliberately UN-sorted creation order so a filesystem
+// that preserves creation order would expose the bug. ---
+
+test "import path directory emits copy_file actions in sorted (deterministic) order" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    // Create files in a deliberately non-alphabetical creation order.
+    try fx.writeSkill("src/alpha", "alpha", "Alpha dir skill.");
+    try fx.writeSupportFile("src/alpha", "zeta.txt", "z");
+    try fx.writeSupportFile("src/alpha", "mike.txt", "m");
+    try fx.writeSupportFile("src/alpha", "bravo.txt", "b");
+    try fx.writeSupportFile("src/alpha", "alpha.txt", "a");
+    try fx.writeSupportFile("src/alpha", "november.txt", "n");
+    const src_dir = try std.fs.path.join(h.arena(), &.{ h.roots.base, "src", "alpha" });
+
+    var c = h.ctx();
+    const r = switch (importmod.path(&c, src_dir)) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+
+    // Collect the copy_file action basenames in emit order; they must be sorted
+    // ascending.
+    var prev: ?[]const u8 = null;
+    var count: usize = 0;
+    for (r.actions) |a| {
+        if (a.action != .copy_file) continue;
+        const base = std.fs.path.basename(a.path);
+        if (prev) |p| {
+            try testing.expect(std.mem.lessThan(u8, p, base));
+        }
+        prev = base;
+        count += 1;
+    }
+    // SKILL.md + 5 support files = 6 copy_file actions.
+    try testing.expectEqual(@as(usize, 6), count);
+}
+
+// --- Finding #14: store() rollback must remove a just-created import directory
+// EVEN when the failure is the OOM of the immediately-following
+// actions.append(.create_directory) — at that point the action list is empty, so
+// a guard that inspects actions.items[0] would wrongly skip rollback and leave an
+// empty <imports-root>/<name> behind (spec "Filesystem Safety": "leave no partial
+// storage on failure"). Sweeping every allocator-failure index guarantees we hit
+// the post-createDirPath append OOM (and every other OOM point); the invariant is
+// that NO imports/alpha directory ever survives a failed import. ---
+
+test "import markdown leaves no partial directory when an allocation fails mid-store (incl. the create_directory append)" {
+    // Sweep a range of allocation-failure indices wide enough to cover the
+    // createDirPath -> actions.append window. The FailingAllocator is used
+    // DIRECTLY as the import arena (no wrapping ArenaAllocator) so every
+    // user-level allocation — including the post-createDirPath
+    // actions.append(.create_directory) — is individually counted and can be
+    // failed. A wrapping arena would batch allocations and mask the exact append.
+    var fail_index: usize = 0;
+    while (fail_index < 60) : (fail_index += 1) {
+        var roots = try testutil.TmpRoots.init(testing.allocator);
+        defer roots.deinit();
+
+        // Back the FailingAllocator with an arena so all (successfully) allocated
+        // memory is reclaimed at deinit (no leaks), while the FailingAllocator —
+        // sitting in front — still counts and can fail each user-level allocation.
+        var backing = std.heap.ArenaAllocator.init(testing.allocator);
+        defer backing.deinit();
+        var failing = std.testing.FailingAllocator.init(backing.allocator(), .{ .fail_index = fail_index });
+        var clk: testutil.FixedClock = .{ .value = 1710000000 };
+        var c: importmod.Context = .{
+            .arena = failing.allocator(),
+            .io = io,
+            .imports_root = roots.imports,
+            .canonical_root = roots.canonical,
+            .clock = clk.clock(),
+        };
+
+        const res = importmod.markdown(&c, valid_md, "clipboard");
+
+        // Whether the import succeeded or OOM'd, it must never leave a partial
+        // imports/alpha directory: either it fully succeeded (a real skill dir
+        // with SKILL.md + import.json) or it rolled back to nothing.
+        const exists = blk: {
+            _ = roots.dir().statFile(io, "imports/alpha", .{ .follow_symlinks = false }) catch break :blk false;
+            break :blk true;
+        };
+        if (res == .err) {
+            try testing.expect(!exists);
+        }
+    }
+}
+
 // --- import path: local Markdown file (spec "import path": Markdown file
 // behavior). ---
 

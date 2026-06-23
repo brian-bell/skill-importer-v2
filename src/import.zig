@@ -222,12 +222,20 @@ fn store(c: *Context, plan: Plan) Result {
 
     var actions: std.ArrayList(types.ImportAction) = .empty;
 
+    // Track whether WE created the skill directory INDEPENDENTLY of the action
+    // list. The `create_directory` action is appended AFTER createDirPath
+    // succeeds, so if that append itself OOMs the action list is still empty —
+    // inspecting actions.items[0] would then wrongly skip rollback and leave an
+    // empty <imports-root>/<name> behind (Finding #14; spec "Filesystem Safety":
+    // "leave no partial storage on failure"). This flag is set the moment the
+    // directory is created, so rollback always fires.
+    var created_dir = false;
+
     // Execute; on any failure roll back the created skill directory so no
     // partial import survives (spec "Filesystem Safety"). Only delete the skill
     // directory if WE created it — never remove a pre-existing entry that the
     // create step failed against (spec: do not remove external entries).
-    executeStore(c, plan, manifest, skill_dir, manifest_path, &actions) catch |err| {
-        const created_dir = actions.items.len > 0 and actions.items[0].action == .create_directory;
+    executeStore(c, plan, manifest, skill_dir, manifest_path, &actions, &created_dir) catch |err| {
         if (created_dir) rollback(c, skill_dir);
         if (err == error.OutOfMemory) return oom();
         return ioErr("write import storage", skill_dir);
@@ -249,11 +257,14 @@ fn executeStore(
     skill_dir: []const u8,
     manifest_path: []const u8,
     actions: *std.ArrayList(types.ImportAction),
+    created_dir: *bool,
 ) !void {
     const cwd = std.Io.Dir.cwd();
 
-    // create_directory.
+    // create_directory. Record that WE created the directory BEFORE appending the
+    // action, so rollback fires even if the append OOMs (Finding #14).
     try cwd.createDirPath(c.io, skill_dir);
+    created_dir.* = true;
     try actions.append(c.arena, .{ .action = .create_directory, .path = skill_dir });
 
     if (plan.src_dir) |src_dir| {
@@ -292,8 +303,13 @@ fn copyDirRecording(
     rel: []const u8,
     actions: *std.ArrayList(types.ImportAction),
 ) !void {
-    var it = src.iterate();
-    while (try it.next(c.io)) |entry| {
+    // Collect entries, then sort by name, so the recorded copy_file actions are
+    // emitted in a DETERMINISTIC order rather than filesystem readdir order
+    // (Finding #13; spec "Output Contract": deterministic output — the
+    // content_hash already sorts by relative path). Entry names are invalidated
+    // by the next iteration step, so dupe each into the arena.
+    const entries = try collectSortedEntries(c, src);
+    for (entries) |entry| {
         switch (entry.kind) {
             .file => {
                 try src.copyFile(entry.name, dst, entry.name, c.io, .{});
@@ -312,6 +328,26 @@ fn copyDirRecording(
             else => return error.UnsupportedEntry,
         }
     }
+}
+
+/// A directory entry whose `name` is owned by the arena (stable across iteration).
+const SortedEntry = struct { name: []const u8, kind: std.Io.File.Kind };
+
+/// Read every entry of `src` into an arena-owned slice sorted ascending by name,
+/// so directory traversal is deterministic (Finding #13).
+fn collectSortedEntries(c: *Context, src: std.Io.Dir) ![]SortedEntry {
+    var list: std.ArrayList(SortedEntry) = .empty;
+    var it = src.iterate();
+    while (try it.next(c.io)) |entry| {
+        try list.append(c.arena, .{ .name = try c.arena.dupe(u8, entry.name), .kind = entry.kind });
+    }
+    const items = try list.toOwnedSlice(c.arena);
+    std.mem.sort(SortedEntry, items, {}, struct {
+        fn lessThan(_: void, a: SortedEntry, b: SortedEntry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+    return items;
 }
 
 fn joinRel(c: *Context, base: []const u8, rel: []const u8, name: []const u8) ![]const u8 {

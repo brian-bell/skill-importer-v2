@@ -228,6 +228,53 @@ test "repository import: multi-file skill records copy_file per file, hash cover
     try testing.expect(std.mem.indexOf(u8, json, "\"action\": \"create_directory\"") != null);
 }
 
+// --- Finding #13: a repository import must emit its copy_file actions in a
+// DETERMINISTIC order, not raw readdir order (spec "Output Contract":
+// deterministic; the content_hash already sorts relative paths). copyDirRecording
+// iterated in filesystem order; this asserts the recorded copy_file basenames in
+// each directory level come out sorted ascending. Files are created in a
+// deliberately non-alphabetical order. ---
+
+test "repository import: copy_file actions are emitted in sorted (deterministic) order" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    // One valid skill carrying several top-level support files written in a
+    // deliberately non-alphabetical creation order.
+    try fx.writeSkill("repo/only", "only", "Only skill.");
+    try fx.writeSupportFile("repo/only", "zeta.txt", "z");
+    try fx.writeSupportFile("repo/only", "mike.txt", "m");
+    try fx.writeSupportFile("repo/only", "bravo.txt", "b");
+    try fx.writeSupportFile("repo/only", "alpha.txt", "a");
+    try fx.writeSupportFile("repo/only", "november.txt", "n");
+    var fp: testutil.FakeProvider = .{ .source_tree = try h.srcTree("repo") };
+
+    var c = h.ctx();
+    const res = repository.import(&c, fp.provider(), "https://example.test/skills.git", no_select);
+    const r = switch (res) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+    try testing.expect(r == .imported);
+    const single = r.imported;
+
+    // copy_file basenames (all at the top level here) must be sorted ascending.
+    var prev: ?[]const u8 = null;
+    var count: usize = 0;
+    for (single.actions) |a| {
+        if (a.action != .copy_file) continue;
+        const base = std.fs.path.basename(a.path);
+        if (prev) |p| {
+            try testing.expect(std.mem.lessThan(u8, p, base));
+        }
+        prev = base;
+        count += 1;
+    }
+    // SKILL.md + 5 support files = 6 copy_file actions.
+    try testing.expectEqual(@as(usize, 6), count);
+}
+
 // --- batch import: imported_at is derived from a SINGLE clock.now() per skill
 // and shares one value across the batch (spec "Import Manifest": imported_at).
 // IncrementingClock advances on every now() call, so a double-now() bug or
