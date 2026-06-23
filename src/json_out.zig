@@ -14,6 +14,21 @@ const types = @import("types.zig");
 /// pretty-printed or otherwise deterministic).
 pub const json_options: std.json.Stringify.Options = .{ .whitespace = .indent_2 };
 
+/// Emit the full `list --format json` inventory (spec "JSON Schemas > Inventory").
+/// Key order is the declaration order of the `types` structs, which mirrors the
+/// spec field-for-field: name, description?, source, source_repository?, promoted,
+/// enablement{claude_code,codex}, agent_entries{claude_code,codex}; and the repo
+/// groups. Optional null fields (`description`, `source_repository`) are OMITTED,
+/// not null (spec "Inventory": those keys appear only when present). The payload
+/// ends in exactly one trailing newline (spec "Output Contract").
+pub fn writeInventory(w: *std.Io.Writer, inv: types.Inventory) std.Io.Writer.Error!void {
+    try std.json.Stringify.value(inv, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    }, w);
+    try w.writeByte('\n');
+}
+
 /// Write an enum value as its snake_case wire token (a bare JSON string).
 /// `std.json.Stringify` serializes a Zig enum as its `@tagName`, which is exactly
 /// the spec spelling for every domain enum.
