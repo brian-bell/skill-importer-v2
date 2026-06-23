@@ -284,6 +284,40 @@ pub const FailingIo = struct {
     }
 };
 
+/// A `std.Io` wrapper that delegates to the real test IO for everything EXCEPT
+/// opening a file whose basename equals `fail_basename`, which it fails with
+/// `error.AccessDenied`. This injects a deterministic, transient READ failure
+/// during directory hashing (`hash.hashDirectory` opens each file via
+/// `dirOpenFile`) WITHOUT it being the spec's "unsupported entry" case — so the
+/// repository scan must surface a `repository_error` rather than silently
+/// dropping an otherwise-valid skill. Single-threaded test use only.
+pub const FailingOpenFileIo = struct {
+    var vtable: std.Io.VTable = undefined;
+    var orig_open: *const fn (?*anyopaque, std.Io.Dir, []const u8, std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File = undefined;
+    var fail_basename: []const u8 = "";
+
+    /// Build a failing IO that fails `dirOpenFile` for the given basename.
+    pub fn forBasename(basename: []const u8) std.Io {
+        vtable = io.vtable.*;
+        orig_open = vtable.dirOpenFile;
+        fail_basename = basename;
+        vtable.dirOpenFile = openFileOverride;
+        return .{ .userdata = io.userdata, .vtable = &vtable };
+    }
+
+    fn openFileOverride(
+        ud: ?*anyopaque,
+        dir: std.Io.Dir,
+        sub_path: []const u8,
+        opts: std.Io.Dir.OpenFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        if (std.mem.eql(u8, std.fs.path.basename(sub_path), fail_basename)) {
+            return error.AccessDenied;
+        }
+        return orig_open(ud, dir, sub_path, opts);
+    }
+};
+
 /// A `std.Io` wrapper that delegates to the real test IO for everything EXCEPT a
 /// `symLink` whose SYM-LINK (new) path CONTAINS `fail_link_substr`, which it
 /// fails with `error.AccessDenied`. Keying on a path substring (e.g. the codex

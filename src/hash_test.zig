@@ -206,6 +206,65 @@ test "hashDirectory: nested file content is read and folded into the digest" {
     try testing.expect(!std.mem.eql(u8, h1, h2));
 }
 
+// Repository imports exclude version-control metadata from the content hash so
+// the digest is DETERMINISTIC across clones (a real `git clone` leaves a `.git`
+// directory whose bytes differ run to run). `hashDirectoryExcludingGit` must
+// ignore a top-level `.git` directory's contents entirely: the digest equals the
+// digest of the same tree with no `.git` at all, and matches the plain
+// `hashDirectory` of the `.git`-free tree.
+test "hashDirectoryExcludingGit: ignores a top-level .git directory's contents" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+
+    // Tree WITH a .git dir (and some nested git metadata).
+    try fx.writeSupportFile("withgit", "SKILL.md", "A\n");
+    try fx.writeSupportFile("withgit/.git", "config", "[core]\n");
+    try fx.writeSupportFile("withgit/.git/objects", "deadbeef", "blob");
+    var dg = try roots.dir().openDir(io, "withgit", .{ .iterate = true });
+    defer dg.close(io);
+    const hg = try hash.hashDirectoryExcludingGit(testing.allocator, io, dg);
+    defer testing.allocator.free(hg);
+
+    // Same tree WITHOUT any .git.
+    try fx.writeSupportFile("nogit", "SKILL.md", "A\n");
+    var dn = try roots.dir().openDir(io, "nogit", .{ .iterate = true });
+    defer dn.close(io);
+    const hn = try hash.hashDirectory(testing.allocator, io, dn);
+    defer testing.allocator.free(hn);
+
+    try testing.expectEqualStrings(hn, hg);
+}
+
+// A `.git` SYMLINK (as a real `git clone` of certain layouts can leave) must NOT
+// trip the UnsupportedEntry rejection when excluding git metadata.
+test "hashDirectoryExcludingGit: tolerates a .git symlink entry" {
+    var roots = try testutil.TmpRoots.init(testing.allocator);
+    defer roots.deinit();
+    var fx = testutil.Fixtures.init(&roots);
+
+    try fx.writeSupportFile("linkgit", "SKILL.md", "A\n");
+    try fx.symlink("elsewhere", "linkgit/.git");
+    var d = try roots.dir().openDir(io, "linkgit", .{ .iterate = true });
+    defer d.close(io);
+
+    // Plain hashDirectory rejects the symlink...
+    try testing.expectError(error.UnsupportedEntry, hash.hashDirectory(testing.allocator, io, d));
+
+    // ...but the git-excluding variant ignores it and hashes only SKILL.md.
+    var d2 = try roots.dir().openDir(io, "linkgit", .{ .iterate = true });
+    defer d2.close(io);
+    const got = try hash.hashDirectoryExcludingGit(testing.allocator, io, d2);
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.startsWith(u8, got, "sha256:"));
+
+    // A non-.git symlink is still rejected by the git-excluding variant.
+    try fx.symlink("SKILL.md", "linkgit/alias");
+    var d3 = try roots.dir().openDir(io, "linkgit", .{ .iterate = true });
+    defer d3.close(io);
+    try testing.expectError(error.UnsupportedEntry, hash.hashDirectoryExcludingGit(testing.allocator, io, d3));
+}
+
 // spec "import path": "Symlinks and unsupported filesystem entries are
 // rejected." The hash treats any non-dir/non-file entry as an error.
 test "hashDirectory: errors on a symlink entry" {

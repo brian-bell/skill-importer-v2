@@ -1096,6 +1096,129 @@ test "repository import: batch allows a canonical collision as a replacement dra
     try testing.expect(h.importsExists("repo-beta/import.json"));
 }
 
+// --- #3: version-control metadata is excluded from the import (spec "import
+// repository": deterministic content hash; a real `git clone` leaves a `.git`
+// directory whose bytes differ run to run). A repo skill carrying a `.git`
+// directory must import WITHOUT a `.git` in the destination, and its content_hash
+// must EXCLUDE `.git` (equal to an independent hash of the `.git`-free tree). ---
+
+test "repository import: .git metadata is excluded from the copy and the content hash" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    // One valid skill that also carries a `.git` directory (as a clone would).
+    try fx.writeSkill("repo/repo-alpha", "repo-alpha", "First.");
+    try fx.writeSupportFile("repo/repo-alpha", "helper.txt", "data");
+    try fx.writeSupportFile("repo/repo-alpha/.git", "config", "[core]\n");
+    try fx.writeSupportFile("repo/repo-alpha/.git/objects", "abc123", "blob");
+    var fp: testutil.FakeProvider = .{ .source_tree = try h.srcTree("repo") };
+
+    var c = h.ctx();
+    const res = repository.import(&c, fp.provider(), "https://example.test/skills.git", no_select);
+    const r = switch (res) {
+        .ok => |r| r,
+        .err => return error.ImportFailed,
+    };
+    try testing.expect(r == .imported);
+
+    // The real skill files landed; the `.git` directory did NOT.
+    try testing.expect(h.importsExists("repo-alpha/SKILL.md"));
+    try testing.expect(h.importsExists("repo-alpha/helper.txt"));
+    try testing.expect(!h.importsExists("repo-alpha/.git"));
+    try testing.expect(!h.importsExists("repo-alpha/.git/config"));
+
+    // No copy_file action references anything under `.git`.
+    for (r.imported.actions) |a| {
+        try testing.expect(std.mem.indexOf(u8, a.path, ".git") == null);
+    }
+
+    // content_hash equals an independent hash of the SOURCE skill dir with `.git`
+    // EXCLUDED (so it is deterministic across clones).
+    {
+        var sdir = try h.roots.dir().openDir(io, try std.fs.path.join(h.arena(), &.{ "repo", "repo-alpha" }), .{ .iterate = true });
+        defer sdir.close(io);
+        const expected = try hash.hashDirectoryExcludingGit(h.arena(), io, sdir);
+        try testing.expectEqualStrings(expected, r.imported.manifest.content_hash);
+    }
+}
+
+// A test provider that materializes a fixed checkout: a ROOT skill (valid
+// SKILL.md) plus a convenience SYMLINK in the root. FakeProvider drops symlinks,
+// so this builds the checkout directly to reproduce the real-clone shape where a
+// symlink sits beside a valid root SKILL.md.
+const RootSymlinkProvider = struct {
+    fn provider(self: *RootSymlinkProvider) git.Provider {
+        return .{ .checkoutFn = checkoutImpl, .ctx = self };
+    }
+    fn checkoutImpl(_: *anyopaque, _: []const u8, dest_path: []const u8) git.Provider.CheckoutError!void {
+        const cwd = std.Io.Dir.cwd();
+        cwd.createDirPath(io, dest_path) catch return error.RepositoryError;
+        var d = cwd.openDir(io, dest_path, .{}) catch return error.RepositoryError;
+        defer d.close(io);
+        d.writeFile(io, .{
+            .sub_path = "SKILL.md",
+            .data = "---\nname: root-skill\ndescription: A root skill.\n---\n",
+        }) catch return error.RepositoryError;
+        // A convenience symlink beside the valid root SKILL.md.
+        d.symLink(io, "SKILL.md", "alias", .{}) catch return error.RepositoryError;
+    }
+};
+
+// --- #5: a VALID ROOT skill whose directory contains a (non-.git) symlink must
+// NOT silently vanish. Hashing the root dir trips error.UnsupportedEntry; the old
+// `else => return` dropped the root skill, degrading to empty_repository. Spec:
+// "If the repository root has invalid SKILL.md, fail; do not skip it and import
+// nested skills." A root skill that cannot be hashed must surface a
+// repository_error (fail), never an empty/missing result. ---
+
+test "repository import: valid root skill with a symlink in root surfaces repository_error, not empty" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    var rp: RootSymlinkProvider = .{};
+    var c = h.ctx();
+    const res = repository.import(&c, rp.provider(), "https://example.test/skills.git", no_select);
+
+    // It must FAIL as a repository_error (NOT empty_repository, NOT a silent skip).
+    try expectErr(res, .repository_error);
+    // Nothing was written.
+    try testing.expect(!h.importsExists("root-skill"));
+}
+
+// --- #15: a transient I/O error while hashing a NESTED valid skill must surface
+// a repository_error, not silently drop the skill (which degraded to
+// empty_repository / missing_selection). The skill's SKILL.md reads fine (so it
+// is a VALID skill), but reading a support file during hashing fails with a
+// non-UnsupportedEntry error. ---
+
+test "repository import: an I/O error while hashing a valid skill surfaces repository_error" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var fx = testutil.Fixtures.init(&h.roots);
+
+    // A single valid nested skill carrying a support file whose READ will fail.
+    try fx.writeSkill("repo/only", "only", "Only skill.");
+    try fx.writeSupportFile("repo/only", "unreadable.bin", "secret");
+    var fp: testutil.FakeProvider = .{ .source_tree = try h.srcTree("repo") };
+
+    // Fail opening (reading) the support file during hashing, but not SKILL.md.
+    const failing_io = testutil.FailingOpenFileIo.forBasename("unreadable.bin");
+    var c: repository.Context = .{
+        .arena = h.arena(),
+        .io = failing_io,
+        .imports_root = h.roots.imports,
+        .canonical_root = h.roots.canonical,
+        .clock = h.clock_state.clock(),
+    };
+
+    const res = repository.import(&c, fp.provider(), "https://example.test/skills.git", no_select);
+    // The valid skill must not vanish: surface a repository_error, NOT
+    // empty_repository.
+    try expectErr(res, .repository_error);
+    try testing.expect(!h.importsExists("only"));
+}
+
 fn gitAvailable() bool {
     const res = std.process.run(testing.allocator, io, .{
         .argv = &.{ "git", "--version" },

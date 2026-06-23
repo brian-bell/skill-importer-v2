@@ -133,9 +133,21 @@ fn scan(c: *Context, checkout: []const u8, repository: []const u8, discovered: *
     const cwd = std.Io.Dir.cwd();
 
     // Root skill first (spec: "root-skill-first then nested"). An invalid root
-    // SKILL.md fails (spec: do not skip to nested).
+    // SKILL.md fails (spec: do not skip to nested). A VALID root skill that
+    // cannot be hashed (e.g. a convenience symlink in the root trips
+    // UnsupportedEntry, or a transient I/O error) must ALSO fail as a
+    // repository_error — never silently drop the root and degrade to a
+    // selection/empty result.
     switch (try readSkillAt(c, checkout)) {
-        .present => |md| try appendDiscovered(c, discovered, md, checkout, ".", repository),
+        .present => |md| appendDiscovered(c, discovered, md, checkout, ".", repository) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .err = .{
+                .kind = .repository_error,
+                .repository = dup(c, repository),
+                .path = dup(c, "."),
+                .reason = "repository root skill could not be hashed",
+            } },
+        },
         .invalid => return .{ .err = .{ .kind = .repository_error, .repository = dup(c, repository), .path = dup(c, "SKILL.md"), .reason = "repository root SKILL.md is invalid" } },
         .absent => {},
     }
@@ -153,9 +165,23 @@ fn scan(c: *Context, checkout: []const u8, repository: []const u8, discovered: *
         const item = queue.items[head];
         const abs = try std.fs.path.join(c.arena, &.{ checkout, item.rel });
 
-        // Nested skill: ignore invalid (spec: IgnoreInvalid for nested).
+        // Nested skill: ignore INVALID content (spec: IgnoreInvalid for nested).
+        // An UnsupportedEntry (e.g. a symlink in the skill dir) is treated as
+        // invalid/not-importable and skipped, but any OTHER hash error is an
+        // unexpected I/O failure that must surface as a repository_error rather
+        // than silently dropping an otherwise-valid skill (it would later be
+        // misreported as missing_selection / empty_repository).
         switch (try readSkillAt(c, abs)) {
-            .present => |md| try appendDiscovered(c, discovered, md, abs, item.rel, repository),
+            .present => |md| appendDiscovered(c, discovered, md, abs, item.rel, repository) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnsupportedEntry => {},
+                else => return .{ .err = .{
+                    .kind = .repository_error,
+                    .repository = dup(c, repository),
+                    .path = dup(c, item.rel),
+                    .reason = "skill directory could not be hashed",
+                } },
+            },
             .invalid, .absent => {},
         }
 
@@ -201,6 +227,14 @@ fn enqueueChildren(
     }
 }
 
+/// Hash a skill directory for the repository content_hash, EXCLUDING version-
+/// control metadata (`.git`) so the digest is deterministic across clones and a
+/// `.git` symlink does not trip `error.UnsupportedEntry` (spec "import
+/// repository"). The error is propagated to the caller, which classifies it:
+/// `error.UnsupportedEntry` is "invalid skill content" (skipped for NESTED
+/// skills per IgnoreInvalid; a FAIL for the ROOT), while any other error is an
+/// unexpected I/O failure that must surface as a repository_error rather than
+/// making a valid skill vanish.
 fn appendDiscovered(
     c: *Context,
     discovered: *std.ArrayList(Discovered),
@@ -211,12 +245,7 @@ fn appendDiscovered(
 ) !void {
     var dir = try std.Io.Dir.cwd().openDir(c.io, abs_path, .{ .iterate = true });
     defer dir.close(c.io);
-    const content_hash = hash.hashDirectory(c.arena, c.io, dir) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        // A skill dir with an unsupported entry (symlink) cannot be hashed; treat
-        // it as not importable by skipping.
-        else => return,
-    };
+    const content_hash = try hash.hashDirectoryExcludingGit(c.arena, c.io, dir);
     const source_location = try std.fmt.allocPrint(c.arena, "{s}#{s}", .{ repository, rel_path });
     try discovered.append(c.arena, .{
         .name = try c.arena.dupe(u8, md.name),
@@ -467,6 +496,11 @@ fn copyDirRecording(
 ) !void {
     var it = src.iterate();
     while (try it.next(c.io)) |entry| {
+        // Exclude version-control metadata (`.git`) from the copy so the imported
+        // skill never carries a clone's `.git` directory/symlink, matching the
+        // content_hash which also excludes it (spec "import repository";
+        // deterministic, clone-independent imports). `.git` anywhere is skipped.
+        if (std.mem.eql(u8, entry.name, ".git")) continue;
         switch (entry.kind) {
             .file => {
                 try src.copyFile(entry.name, dst, entry.name, c.io, .{});

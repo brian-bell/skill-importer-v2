@@ -31,6 +31,30 @@ pub fn hashString(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
 /// entry (spec "import path": "Symlinks and unsupported filesystem entries are
 /// rejected."). Caller owns the result.
 pub fn hashDirectory(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]u8 {
+    return hashDirectoryImpl(gpa, io, dir, false);
+}
+
+/// Like `hashDirectory`, but EXCLUDES any version-control metadata: a path whose
+/// first component is `.git` (the top-level `.git` directory or symlink a real
+/// `git clone` leaves behind), and any `.git` nested deeper, is ignored entirely
+/// — neither its presence nor its bytes affect the digest, and a `.git` SYMLINK
+/// no longer trips `error.UnsupportedEntry`. This keeps the repository import
+/// `content_hash` DETERMINISTIC across clones (the `.git` directory differs run
+/// to run). Caller owns the result.
+pub fn hashDirectoryExcludingGit(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]u8 {
+    return hashDirectoryImpl(gpa, io, dir, true);
+}
+
+/// Returns true when the FIRST path component of `rel` (OS-native or '/'
+/// separated) is exactly `.git` — i.e. `rel` is the `.git` dir/link itself or
+/// lives anywhere under a `.git`.
+fn isGitPath(rel: []const u8) bool {
+    var i: usize = 0;
+    while (i < rel.len and rel[i] != '/' and rel[i] != '\\') : (i += 1) {}
+    return std.mem.eql(u8, rel[0..i], ".git");
+}
+
+fn hashDirectoryImpl(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, exclude_git: bool) ![]u8 {
     // For each regular file keep TWO forms of its relative path:
     //   - `native`: the walker's OS-native path (using the OS separator) — used
     //     to OPEN/READ the bytes. On '\'-separator OSes this is the only form
@@ -53,6 +77,11 @@ pub fn hashDirectory(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]u8 
     var walker = try dir.walk(gpa);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
+        // Version-control metadata is excluded entirely for repository imports:
+        // skip `.git` (and anything beneath it) regardless of entry kind, so a
+        // `.git` directory's contents do not enter the digest and a `.git`
+        // SYMLINK does not trip the UnsupportedEntry rejection below.
+        if (exclude_git and isGitPath(entry.path)) continue;
         switch (entry.kind) {
             .directory => {},
             .file => {
