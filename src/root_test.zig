@@ -19,4 +19,6 @@ comptime {
     _ = @import("discovery_test.zig");
     _ = @import("net.zig");
     _ = @import("net_test.zig");
+    _ = @import("import.zig");
+    _ = @import("import_test.zig");
 }

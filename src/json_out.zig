@@ -29,6 +29,20 @@ pub fn writeInventory(w: *std.Io.Writer, inv: types.Inventory) std.Io.Writer.Err
     try w.writeByte('\n');
 }
 
+/// Emit a markdown/path/url import result (spec "JSON Schemas > Import Result").
+/// Key order mirrors the spec: skill_name, skill_path, manifest_path, manifest
+/// {source_type, source_location?, source_repository?, imported_at, content_hash,
+/// promoted}, actions[{action, path}]. Absent optional manifest fields are
+/// omitted (spec "Import Manifest"). Ends in exactly one trailing newline (spec
+/// "Output Contract").
+pub fn writeImportResult(w: *std.Io.Writer, r: types.ImportResult) std.Io.Writer.Error!void {
+    try std.json.Stringify.value(r, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    }, w);
+    try w.writeByte('\n');
+}
+
 /// Write an enum value as its snake_case wire token (a bare JSON string).
 /// `std.json.Stringify` serializes a Zig enum as its `@tagName`, which is exactly
 /// the spec spelling for every domain enum.

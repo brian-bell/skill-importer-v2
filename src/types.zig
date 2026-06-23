@@ -6,6 +6,19 @@
 
 const std = @import("std");
 
+/// Injectable clock so `imported_at` (spec "Import Manifest") is deterministic in
+/// tests (zig-clean-room-cli.md: clock injection `now: fn () i64`). Lives in the
+/// domain model (not the test-only module) so production code can depend on it
+/// without pulling test infrastructure.
+pub const Clock = struct {
+    nowFn: *const fn (ctx: *anyopaque) i64,
+    ctx: *anyopaque,
+
+    pub fn now(self: Clock) i64 {
+        return self.nowFn(self.ctx);
+    }
+};
+
 /// `source` values (spec "Inventory": `source`).
 pub const SkillSource = enum {
     canonical,

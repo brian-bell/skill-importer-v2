@@ -190,16 +190,10 @@ pub const Fixtures = struct {
 // Injectable side-effect providers (zig-clean-room-cli.md "Test infrastructure").
 // ---------------------------------------------------------------------------
 
-/// Injectable clock so `imported_at` is deterministic in manifest assertions
-/// (zig-clean-room-cli.md: clock injection `now: fn () i64`).
-pub const Clock = struct {
-    nowFn: *const fn (ctx: *anyopaque) i64,
-    ctx: *anyopaque,
-
-    pub fn now(self: Clock) i64 {
-        return self.nowFn(self.ctx);
-    }
-};
+/// Injectable clock interface; the canonical type lives in the domain model
+/// (types.Clock) so production code can use it without importing this test-only
+/// module. Re-exported here for test convenience.
+pub const Clock = types.Clock;
 
 /// A clock that always returns a fixed timestamp.
 pub const FixedClock = struct {
