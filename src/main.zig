@@ -27,6 +27,8 @@ const json_out = @import("json_out.zig");
 const net = @import("net.zig");
 const git = @import("git.zig");
 const analyzer = @import("analyzer.zig");
+const analyzer_launch = @import("analyzer_launch.zig");
+const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
     const code = run(init) catch |err| {
@@ -90,8 +92,13 @@ fn run(init: std.process.Init) !u8 {
     var clock_state = RealClock{ .io = io };
     const clock = clock_state.clock();
 
+    // Resolve this binary's path for the analyzer launch script (it `cd`s into a
+    // workspace, so a relative argv[0] is absolutized; a bare name resolves via
+    // the inherited PATH). Only used by `analyze`.
+    const self_exe = try resolveSelfExe(arena, io, init.minimal.args);
+
     // --- dispatch + render ---
-    return dispatch(arena, io, gpa, parsed, resolved, clock);
+    return dispatch(arena, io, gpa, parsed, resolved, clock, init.environ_map, self_exe);
 }
 
 fn dispatch(
@@ -101,6 +108,8 @@ fn dispatch(
     parsed: cli.Parsed,
     resolved: discovery.Roots,
     clock: types.Clock,
+    environ_map: *std.process.Environ.Map,
+    self_exe: []const u8,
 ) !u8 {
     switch (parsed.command) {
         .list => {
@@ -156,9 +165,74 @@ fn dispatch(
             const r = ops.delete(&ctx, c.skill);
             return renderResult(io, arena, parsed.format, r, json_out.writeSkillOperationResult, textOperation);
         },
+        .analyze => |c| {
+            const home = environ_map.get("HOME") orelse "";
+            const codex_home = environ_map.get("CODEX_HOME") orelse
+                (if (home.len != 0) try std.fs.path.join(arena, &.{ home, ".codex" }) else "");
+            const inherited = try collectInheritedEnv(arena, environ_map);
+            var spawner_state = analyzer_launch.RealSpawner{ .gpa = gpa, .io = io };
+            var actx = analyzer_launch.Context{
+                .arena = arena,
+                .io = io,
+                .canonical_root = resolved.canonical,
+                .imports_root = resolved.imports,
+                .claude_code_root = resolved.claude_code,
+                .codex_root = resolved.codex,
+                .home = home,
+                .codex_home = codex_home,
+                .inherited_env = inherited,
+                .current_exe = self_exe,
+                .clock = clock,
+                .is_macos = builtin.target.os.tag == .macos,
+            };
+            const r = analyzer_launch.analyze(&actx, spawner_state.spawner(), c.skill);
+            return renderResult(io, arena, parsed.format, r, jsonAnalyze, textAnalyze);
+        },
         .render_analysis_report => unreachable, // handled in `run`
         .tui => unreachable, // handled in `run`
     }
+}
+
+/// Collect the locale/terminal/PATH passthrough environment for an analyzer
+/// launch (analyzer.inheritedEnvEntry filter), sorted by name for determinism.
+fn collectInheritedEnv(arena: std.mem.Allocator, map: *std.process.Environ.Map) ![]const analyzer.EnvEntry {
+    var list: std.ArrayList(analyzer.EnvEntry) = .empty;
+    var it = map.iterator();
+    while (it.next()) |e| {
+        if (analyzer.inheritedEnvEntry(e.key_ptr.*, e.value_ptr.*)) |entry| {
+            try list.append(arena, .{
+                .name = try arena.dupe(u8, entry.name),
+                .value = try arena.dupe(u8, entry.value),
+            });
+        }
+    }
+    std.mem.sort(analyzer.EnvEntry, list.items, {}, envLess);
+    return list.toOwnedSlice(arena);
+}
+
+fn envLess(_: void, a: analyzer.EnvEntry, b: analyzer.EnvEntry) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+/// Best-effort current-executable path from argv[0]: absolute as-is, relative
+/// absolutized against cwd (the launch script `cd`s), bare name left for PATH.
+fn resolveSelfExe(arena: std.mem.Allocator, io: std.Io, args: std.process.Args) ![]const u8 {
+    var it = args.iterate();
+    const argv0 = it.next() orelse return "";
+    if (argv0.len == 0 or std.fs.path.isAbsolute(argv0)) return arena.dupe(u8, argv0);
+    if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
+        return std.Io.Dir.cwd().realPathFileAlloc(io, argv0, arena) catch arena.dupe(u8, argv0);
+    }
+    return arena.dupe(u8, argv0);
+}
+
+fn jsonAnalyze(w: *std.Io.Writer, r: analyzer_launch.AnalyzeResult) std.Io.Writer.Error!void {
+    try std.json.Stringify.value(r, json_out.json_options, w);
+    try w.writeByte('\n');
+}
+
+fn textAnalyze(w: *std.Io.Writer, r: analyzer_launch.AnalyzeResult) std.Io.Writer.Error!void {
+    try w.print("analysis launched for {s}; report: {s}\n", .{ r.skill_name, r.report_path });
 }
 
 /// Emit the `render-analysis-report` success line. Text: a short confirmation;
@@ -340,6 +414,9 @@ fn kindMessage(kind: result.ErrorKind) []const u8 {
         .malformed_report => "the analysis report JSON is malformed",
         .report_input_invalid => "the analysis report input is not a readable regular file",
         .report_output_exists => "the analysis report output already exists",
+        .unsupported_platform => "skill analysis launch is supported only on macOS",
+        .codex_unavailable => "the codex CLI was not found or could not be executed",
+        .file_backed_codex_auth => "skill analysis cannot run with file-backed Codex auth; use a credential mode that is not exposed to shell tools",
         .io_error => "a filesystem operation failed",
         .out_of_memory => "out of memory",
     };

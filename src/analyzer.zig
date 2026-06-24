@@ -206,6 +206,22 @@ pub fn shellQuote(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     return aw.written();
 }
 
+/// Quote a value as an AppleScript string literal (v1 `applescript_quote`):
+/// wrap in double quotes, escaping `\` and `"`. Used to embed the `sh <script>`
+/// command inside the `osascript` Terminal launch.
+pub fn applescriptQuote(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    const w = &aw.writer;
+    try w.writeByte('"');
+    for (value) |ch| switch (ch) {
+        '\\' => try w.writeAll("\\\\"),
+        '"' => try w.writeAll("\\\""),
+        else => try w.writeByte(ch),
+    };
+    try w.writeByte('"');
+    return aw.written();
+}
+
 /// Reduce a skill name to a filesystem-safe slug (v1 `sanitize_name`): keep
 /// `[A-Za-z0-9_-]`, replace the rest with `-`, trim leading/trailing `-`, and
 /// fall back to `skill` when nothing survives.

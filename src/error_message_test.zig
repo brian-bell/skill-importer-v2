@@ -105,3 +105,24 @@ test "errorMessage: report_output_exists names the output path" {
     });
     try testing.expect(std.mem.indexOf(u8, msg, "/tmp/index.html") != null);
 }
+
+// Non-spec analyzer launch: the macOS gate names the skill it refused.
+test "errorMessage: unsupported_platform names the skill" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const msg = try render(arena_s.allocator(), .{ .kind = .unsupported_platform, .name = "demo" });
+    try testing.expect(std.mem.indexOf(u8, msg, "macOS") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "demo") != null);
+}
+
+// Non-spec analyzer launch: file-backed auth refusal names the auth path.
+test "errorMessage: file_backed_codex_auth names the path" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const msg = try render(arena_s.allocator(), .{
+        .kind = .file_backed_codex_auth,
+        .name = "demo",
+        .path = "/home/.codex/auth.json",
+    });
+    try testing.expect(std.mem.indexOf(u8, msg, "/home/.codex/auth.json") != null);
+}

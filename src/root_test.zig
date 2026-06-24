@@ -35,4 +35,6 @@ comptime {
     _ = @import("error_message_test.zig");
     _ = @import("analyzer.zig");
     _ = @import("analyzer_test.zig");
+    _ = @import("analyzer_launch.zig");
+    _ = @import("analyzer_launch_test.zig");
 }

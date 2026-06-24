@@ -1041,3 +1041,22 @@ test "render-analysis-report with malformed JSON exits 1 with stderr" {
     try testing.expect(std.mem.indexOf(u8, run.stderr, "skill-importer:") != null);
     try testing.expect(std.mem.indexOf(u8, run.stderr, "malformed") != null);
 }
+
+// Non-spec analyzer launch: `analyze` for a missing skill (or off macOS) exits 1
+// with actionable stderr. Robust across platforms: on non-macOS it is the
+// platform gate; on macOS with explicit empty roots the skill is unknown. Either
+// way the launch never proceeds and the exit is non-zero.
+test "analyze for an unknown skill exits 1 with stderr" {
+    const gpa = testing.allocator;
+    var tr = try tu.TmpRoots.init(gpa);
+    defer tr.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    const argv = try concat(arena, try rootArgs(arena, &tr), &.{ "analyze", "--skill", "nope" });
+    var run = try runCli(gpa, argv);
+    defer run.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), run.code);
+    try testing.expect(std.mem.indexOf(u8, run.stderr, "skill-importer:") != null);
+}

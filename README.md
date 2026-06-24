@@ -93,6 +93,7 @@ skill-importer [global-options] promote   --skill NAME [--overwrite]
 skill-importer [global-options] unpromote --skill NAME
 skill-importer [global-options] delete    --skill NAME
 skill-importer [global-options] render-analysis-report --input PATH --output PATH
+skill-importer [global-options] analyze --skill NAME
 skill-importer [global-options] tui
 ```
 
@@ -128,6 +129,14 @@ skill-importer [global-options] tui
   input must be a regular file (symlinks are refused) and the output is created
   fresh (an existing file is never overwritten). Operates on explicit paths only:
   it needs no roots and no `HOME`.
+- `analyze` — **non-spec extension**, **macOS only**, and requires the `codex`
+  CLI on `PATH`. Snapshot-copy a managed skill into an isolated, read-only,
+  no-network workspace and launch `codex exec` in a new Terminal window to
+  produce a security/walkthrough report, which is rendered to HTML via
+  `render-analysis-report` and opened. The snapshot refuses any symlink escaping
+  the skill directory, and the launch is refused when `<codex-home>/auth.json`
+  exists (file-backed Codex auth must not be exposed to the analyzed skill). On
+  non-macOS hosts it exits `1` with an unsupported-platform error.
 
 `--skill`, `--path`, `--url`, `--repository`, `--source-location`, `--input`, and
 `--output` are single-value options; `--agent` and `--select` are repeatable;

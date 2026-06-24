@@ -262,3 +262,19 @@ test "render-analysis-report requires --output" {
     const r = parse(arena_s.allocator(), &.{ "render-analysis-report", "--input", "r.json" });
     try testing.expect(!r.isOk());
 }
+
+// Non-spec extension: `analyze --skill NAME`.
+test "parse analyze with skill" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const p = parse(arena_s.allocator(), &.{ "analyze", "--skill", "demo" }).ok;
+    try testing.expect(p.command == .analyze);
+    try testing.expectEqualStrings("demo", p.command.analyze.skill);
+}
+
+test "analyze requires --skill" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const r = parse(arena_s.allocator(), &.{"analyze"});
+    try testing.expect(!r.isOk());
+}
