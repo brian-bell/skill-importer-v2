@@ -21,6 +21,8 @@ comptime {
     _ = @import("discovery_test.zig");
     _ = @import("net.zig");
     _ = @import("net_test.zig");
+    _ = @import("recording_copy.zig");
+    _ = @import("recording_copy_test.zig");
     _ = @import("import.zig");
     _ = @import("import_test.zig");
     _ = @import("git.zig");

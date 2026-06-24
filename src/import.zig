@@ -25,6 +25,7 @@ const manifest_mod = @import("manifest.zig");
 const hash = @import("hash.zig");
 const fsutil = @import("fsutil.zig");
 const net = @import("net.zig");
+const recording_copy = @import("recording_copy.zig");
 
 /// Injected dependencies for an import operation. All output strings are owned
 /// by `arena`.
@@ -274,7 +275,8 @@ fn executeStore(
         defer src.close(c.io);
         var dst = try cwd.openDir(c.io, skill_dir, .{});
         defer dst.close(c.io);
-        try copyDirRecording(c, src, dst, skill_dir, "", actions);
+        var snk: CopyFileSink = .{ .arena = c.arena, .actions = actions };
+        try recording_copy.copyTree(c.arena, c.io, src, dst, skill_dir, "", recording_copy.exclude_none, snk.sink());
     } else {
         // Single-file import: write SKILL.md (write_skill action).
         const skill_path = try std.fs.path.join(c.arena, &.{ skill_dir, "SKILL.md" });
@@ -290,74 +292,21 @@ fn executeStore(
     try actions.append(c.arena, .{ .action = .write_manifest, .path = manifest_path });
 }
 
-/// Recursively copy `src` into `dst`, recording a `copy_file` action (with the
-/// destination absolute path) for each regular file. Directories are created and
-/// recursed; symlinks/unsupported entries are rejected (they were already
-/// rejected by the hash walk, but guard here too). `rel` is the path under the
-/// skill dir for building absolute action paths.
-fn copyDirRecording(
-    c: *Context,
-    src: std.Io.Dir,
-    dst: std.Io.Dir,
-    skill_dir: []const u8,
-    rel: []const u8,
+/// Adapts `recording_copy.copyTree`'s `Sink` to an import action list: each copied
+/// regular file appends a `copy_file` action with its absolute destination path
+/// (spec "Import action values": copy_file). The emitted path is arena-owned by
+/// copyTree, so it is appended directly.
+const CopyFileSink = struct {
+    arena: std.mem.Allocator,
     actions: *std.ArrayList(types.ImportAction),
-) !void {
-    // Collect entries, then sort by name, so the recorded copy_file actions are
-    // emitted in a DETERMINISTIC order rather than filesystem readdir order
-    // (Finding #13; spec "Output Contract": deterministic output — the
-    // content_hash already sorts by relative path). Entry names are invalidated
-    // by the next iteration step, so dupe each into the arena.
-    const entries = try collectSortedEntries(c, src);
-    for (entries) |entry| {
-        switch (entry.kind) {
-            .file => {
-                try src.copyFile(entry.name, dst, entry.name, c.io, .{});
-                const abs = try joinRel(c, skill_dir, rel, entry.name);
-                try actions.append(c.arena, .{ .action = .copy_file, .path = abs });
-            },
-            .directory => {
-                try dst.createDirPath(c.io, entry.name);
-                var sub_src = try src.openDir(c.io, entry.name, .{ .iterate = true });
-                defer sub_src.close(c.io);
-                var sub_dst = try dst.openDir(c.io, entry.name, .{});
-                defer sub_dst.close(c.io);
-                const sub_rel = try joinRel(c, "", rel, entry.name);
-                try copyDirRecording(c, sub_src, sub_dst, skill_dir, sub_rel, actions);
-            },
-            else => return error.UnsupportedEntry,
-        }
+    fn sink(self: *CopyFileSink) recording_copy.Sink {
+        return .{ .ctx = self, .emitFn = emit };
     }
-}
-
-/// A directory entry whose `name` is owned by the arena (stable across iteration).
-const SortedEntry = struct { name: []const u8, kind: std.Io.File.Kind };
-
-/// Read every entry of `src` into an arena-owned slice sorted ascending by name,
-/// so directory traversal is deterministic (Finding #13).
-fn collectSortedEntries(c: *Context, src: std.Io.Dir) ![]SortedEntry {
-    var list: std.ArrayList(SortedEntry) = .empty;
-    var it = src.iterate();
-    while (try it.next(c.io)) |entry| {
-        try list.append(c.arena, .{ .name = try c.arena.dupe(u8, entry.name), .kind = entry.kind });
+    fn emit(ctx: *anyopaque, abs_path: []const u8) anyerror!void {
+        const self: *CopyFileSink = @ptrCast(@alignCast(ctx));
+        try self.actions.append(self.arena, .{ .action = .copy_file, .path = abs_path });
     }
-    const items = try list.toOwnedSlice(c.arena);
-    std.mem.sort(SortedEntry, items, {}, struct {
-        fn lessThan(_: void, a: SortedEntry, b: SortedEntry) bool {
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lessThan);
-    return items;
-}
-
-fn joinRel(c: *Context, base: []const u8, rel: []const u8, name: []const u8) ![]const u8 {
-    if (base.len == 0) {
-        if (rel.len == 0) return c.arena.dupe(u8, name);
-        return std.fs.path.join(c.arena, &.{ rel, name });
-    }
-    if (rel.len == 0) return std.fs.path.join(c.arena, &.{ base, name });
-    return std.fs.path.join(c.arena, &.{ base, rel, name });
-}
+};
 
 /// Best-effort removal of a partially-written import directory (rollback).
 fn rollback(c: *Context, skill_dir: []const u8) void {

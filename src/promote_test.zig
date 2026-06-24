@@ -317,6 +317,45 @@ test "promote: every copy_file action path points at an existing file under cano
     try testing.expect(saw_copy);
 }
 
+// --- Finding #13 (now closed for promote): promote must emit copy_file actions
+// in a DETERMINISTIC order, not raw readdir order, matching the deterministic-
+// output requirement (spec "Output Contract"). The import and repository copiers
+// already sorted; promote's copyExcludingManifest iterated in filesystem order
+// and was the one copy that missed the fix. Routing promote through
+// recording_copy.copyTree closes the gap. The fixture writes support files in a
+// deliberately UN-sorted creation order so a filesystem preserving creation order
+// would expose the bug. ---
+test "promote: copy_file actions are emitted in sorted (deterministic) order" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try draft(&h, "omega", "omega", "Omega draft.");
+    // Create support files in a deliberately non-alphabetical creation order.
+    try h.fixtures().writeSupportFile("imports/omega", "zeta.txt", "z");
+    try h.fixtures().writeSupportFile("imports/omega", "mike.txt", "m");
+    try h.fixtures().writeSupportFile("imports/omega", "bravo.txt", "b");
+    try h.fixtures().writeSupportFile("imports/omega", "alpha.txt", "a");
+    try h.fixtures().writeSupportFile("imports/omega", "november.txt", "n");
+    var c = h.ctx();
+
+    const r = try expectOk(ops.promote(&c, "omega", false));
+
+    // Collect the copy_file action basenames in emit order; they must be sorted
+    // ascending (by name within each directory level).
+    var prev: ?[]const u8 = null;
+    var count: usize = 0;
+    for (r.actions) |a| {
+        if (a.action != .copy_file) continue;
+        const base = std.fs.path.basename(a.path);
+        if (prev) |p| {
+            try testing.expect(std.mem.lessThan(u8, p, base));
+        }
+        prev = base;
+        count += 1;
+    }
+    // SKILL.md + 5 support files = 6 copy_file actions (import.json excluded).
+    try testing.expectEqual(@as(usize, 6), count);
+}
+
 test "promote: stage-then-swap leaves no staging/backup litter in canonical (spec promote)" {
     // The stage-then-swap implementation (spec promote: don't remove the old
     // canonical until the replacement is ready) must not leave temporary

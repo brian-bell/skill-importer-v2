@@ -23,6 +23,7 @@ const fsutil = @import("fsutil.zig");
 const managed_entry = @import("managed_entry.zig");
 const frontmatter = @import("frontmatter.zig");
 const manifest_mod = @import("manifest.zig");
+const recording_copy = @import("recording_copy.zig");
 
 const Result = result.Result(types.SkillOperationResult);
 
@@ -593,7 +594,8 @@ fn executePromote(
         // (<canonical>/<name>/...), not the transient staging dir — after the
         // swap the staging path no longer exists (spec promote / Skill Operation
         // Result copy_file 'path' / Filesystem Safety step 5).
-        copyExcludingManifest(c, src, dst, dest_dir, "", actions) catch |err| {
+        var snk: CopyFileSink = .{ .arena = c.arena, .actions = actions };
+        recording_copy.copyTree(c.arena, c.io, src, dst, dest_dir, "", recording_copy.excludeTopImportJson(), snk.sink()) catch |err| {
             cwd.deleteTree(c.io, staging_dir) catch {};
             return err;
         };
@@ -874,46 +876,21 @@ fn treeHasUnsupportedEntry(c: *Context, dir_path: []const u8) anyerror!bool {
     return false;
 }
 
-/// Recursively copy `src` into `dst`, EXCLUDING a top-level `import.json` (spec
-/// promote: "Promotion ... excludes top-level import.json"). Records a copy_file
-/// action per regular file. `rel` is the path under the destination root used to
-/// build absolute action paths; only the top level excludes import.json.
-fn copyExcludingManifest(
-    c: *Context,
-    src: std.Io.Dir,
-    dst: std.Io.Dir,
-    dest_root: []const u8,
-    rel: []const u8,
+/// Adapts `recording_copy.copyTree`'s `Sink` to a skill action list: each copied
+/// regular file appends a `copy_file` action with its absolute destination path.
+/// The emitted path is arena-owned by copyTree, so it is appended directly. The
+/// top-level `import.json` exclusion is handled by `excludeTopImportJson()`.
+const CopyFileSink = struct {
+    arena: std.mem.Allocator,
     actions: *std.ArrayList(types.SkillAction),
-) anyerror!void {
-    const at_top = rel.len == 0;
-    var it = src.iterate();
-    while (try it.next(c.io)) |entry| {
-        switch (entry.kind) {
-            .file => {
-                if (at_top and std.mem.eql(u8, entry.name, "import.json")) continue;
-                try src.copyFile(entry.name, dst, entry.name, c.io, .{});
-                const abs = try joinAbsRel(c, dest_root, rel, entry.name);
-                try actions.append(c.arena, .{ .action = .copy_file, .path = abs });
-            },
-            .directory => {
-                try dst.createDirPath(c.io, entry.name);
-                var sub_src = try src.openDir(c.io, entry.name, .{ .iterate = true });
-                defer sub_src.close(c.io);
-                var sub_dst = try dst.openDir(c.io, entry.name, .{});
-                defer sub_dst.close(c.io);
-                const sub_rel = if (rel.len == 0) entry.name else try std.fs.path.join(c.arena, &.{ rel, entry.name });
-                try copyExcludingManifest(c, sub_src, sub_dst, dest_root, sub_rel, actions);
-            },
-            else => return error.UnsupportedEntry,
-        }
+    fn sink(self: *CopyFileSink) recording_copy.Sink {
+        return .{ .ctx = self, .emitFn = emit };
     }
-}
-
-fn joinAbsRel(c: *Context, base: []const u8, rel: []const u8, name: []const u8) ![]const u8 {
-    if (rel.len == 0) return std.fs.path.join(c.arena, &.{ base, name });
-    return std.fs.path.join(c.arena, &.{ base, rel, name });
-}
+    fn emit(ctx: *anyopaque, abs_path: []const u8) anyerror!void {
+        const self: *CopyFileSink = @ptrCast(@alignCast(ctx));
+        try self.actions.append(self.arena, .{ .action = .copy_file, .path = abs_path });
+    }
+};
 
 /// Read the draft manifest, set its `promoted` flag, and rewrite import.json
 /// (2-space indent, no trailing newline). Records a write_manifest action.
