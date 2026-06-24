@@ -20,6 +20,7 @@ const types = @import("types.zig");
 const result = @import("result.zig");
 const discovery = @import("discovery.zig");
 const fsutil = @import("fsutil.zig");
+const managed_entry = @import("managed_entry.zig");
 const frontmatter = @import("frontmatter.zig");
 const manifest_mod = @import("manifest.zig");
 
@@ -193,11 +194,11 @@ fn preflight(
 ) anyerror!result.Result(AgentPlan) {
     const agent_root = c.agentRoot(agent);
     const link_path = try std.fs.path.join(c.arena, &.{ agent_root, skill_name });
-    const cwd = std.Io.Dir.cwd();
 
-    // Classify the current entry without following the final symlink (spec
-    // "Filesystem Safety": never dereference/replace external entries).
-    const kind = try fsutil.classify(c.io, cwd, link_path);
+    // Classify the current entry against the managed roots (shared classifier:
+    // no-follow classify + broken-link probe + symlinked-ancestor canonicalize;
+    // spec "Filesystem Safety": never dereference/replace external entries).
+    const cls = try managed_entry.classify(c.arena, c.io, link_path);
 
     switch (mode) {
         .enable => {
@@ -217,9 +218,9 @@ fn preflight(
                     .reason = "canonical promoted copy is missing or not a directory; re-promote the skill",
                 } };
             }
-            return enablePlan(c, skill_name, agent, kind, canonical_target);
+            return enablePlan(c, skill_name, agent, cls, canonical_target);
         },
-        .disable => switch (kind) {
+        .disable => switch (cls) {
             // Missing entry => nothing to remove (spec "disable": skip_unchanged).
             .missing => return .{ .ok = .{
                 .agent = agent,
@@ -228,20 +229,24 @@ fn preflight(
                 .target = "",
                 .needs_root = false,
             } },
-            .symlink => {
-                // A BROKEN symlink (target does not resolve) is an unsafe External
-                // entry and must be left untouched, NOT removed (spec "disable":
-                // "Unsafe entries are rejected and left untouched"; spec "Terms":
-                // a broken symlink is an External entry). This is checked BEFORE
-                // the lexical pointing-at tests because a broken managed symlink
-                // still matches `canonical_target`/`imports_target` lexically — the
-                // bug that would remove a dangling managed link (Finding #8).
-                if (!try symlinkResolves(c, link_path)) return unsafe(c, link_path, agent);
+            // A BROKEN symlink (target does not resolve) is an unsafe External
+            // entry and must be left untouched, NOT removed (spec "disable":
+            // "Unsafe entries are rejected and left untouched"; spec "Terms": a
+            // broken symlink is an External entry). The classifier reports it as
+            // `.broken_symlink` BEFORE any pointing-at test, so a dangling managed
+            // link that still matches a target lexically is not removed
+            // (Finding #8).
+            .broken_symlink => return unsafe(c, link_path, agent),
+            .symlink => |target| {
                 // A managed symlink for THIS skill (pointing at the canonical copy
                 // or the draft import dir for a legacy-enabled unpromoted import)
-                // is removed; anything else is unsafe (spec "disable").
-                if (try symlinkPointsAt(c, link_path, canonical_target) or
-                    try symlinkPointsAt(c, link_path, imports_target))
+                // is removed; anything else is unsafe (spec "disable"). The
+                // classifier already canonicalized `target`, so compare against the
+                // canonicalized expected targets.
+                const canon_canonical = try managed_entry.canonicalize(c.arena, c.io, canonical_target);
+                const canon_imports = try managed_entry.canonicalize(c.arena, c.io, imports_target);
+                if (std.mem.eql(u8, target, canon_canonical) or
+                    std.mem.eql(u8, target, canon_imports))
                 {
                     return .{ .ok = .{
                         .agent = agent,
@@ -253,7 +258,7 @@ fn preflight(
                 }
                 return unsafe(c, link_path, agent);
             },
-            .directory, .file => return unsafe(c, link_path, agent),
+            .real_directory, .real_file => return unsafe(c, link_path, agent),
         },
     }
 }
@@ -264,12 +269,12 @@ fn enablePlan(
     c: *Context,
     skill_name: []const u8,
     agent: types.Agent,
-    kind: fsutil.EntryKind,
+    cls: managed_entry.Classification,
     canonical_target: []const u8,
 ) anyerror!result.Result(AgentPlan) {
     const agent_root = c.agentRoot(agent);
     const link_path = try std.fs.path.join(c.arena, &.{ agent_root, skill_name });
-    switch (kind) {
+    switch (cls) {
         .missing => {
             const needs_root = !rootExists(c, agent_root);
             return .{ .ok = .{
@@ -280,11 +285,13 @@ fn enablePlan(
                 .needs_root = needs_root,
             } };
         },
-        .symlink => {
+        .symlink => |target| {
             // Already the correct managed symlink => skip_unchanged; any other
             // symlink target (external or WRONG managed target) is unsafe and
-            // is left untouched (spec "enable").
-            if (try symlinkPointsAt(c, link_path, canonical_target)) {
+            // is left untouched (spec "enable"). The classifier already
+            // canonicalized `target`; compare against the canonicalized target.
+            const canon_canonical = try managed_entry.canonicalize(c.arena, c.io, canonical_target);
+            if (std.mem.eql(u8, target, canon_canonical)) {
                 return .{ .ok = .{
                     .agent = agent,
                     .kind = .skip,
@@ -295,8 +302,11 @@ fn enablePlan(
             }
             return unsafe(c, link_path, agent);
         },
-        // A real directory or regular file is unsafe (spec "enable").
-        .directory, .file => return unsafe(c, link_path, agent),
+        // A real directory, regular file, or broken symlink is unsafe
+        // (spec "enable"; the canonical link target was already proven to exist,
+        // so a managed link to it cannot be broken — a broken link points
+        // elsewhere and is left untouched).
+        .real_directory, .real_file, .broken_symlink => return unsafe(c, link_path, agent),
     }
 }
 
@@ -388,39 +398,6 @@ fn dedupeAgents(arena: std.mem.Allocator, agents: []const types.Agent) ![]const 
 fn rootExists(c: *Context, path: []const u8) bool {
     const kind = fsutil.classify(c.io, std.Io.Dir.cwd(), path) catch return false;
     return kind != .missing;
-}
-
-/// True iff the symlink at `link_path` resolves (lexically, through any existing
-/// symlinked ancestors) to the same canonicalized path as `expected_target`.
-/// Both sides are canonicalized so a managed symlink reached through a symlinked
-/// ancestor (e.g. macOS /tmp -> /private/tmp) is not misclassified (mirrors the
-/// discovery classifier).
-fn symlinkPointsAt(c: *Context, link_path: []const u8, expected_target: []const u8) !bool {
-    const cwd = std.Io.Dir.cwd();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = cwd.readLink(c.io, link_path, &buf) catch return false;
-    const link_dir = std.fs.path.dirname(link_path) orelse ".";
-    const canon_link_dir = try canonOrLexical(c, link_dir);
-    const lexical_target = try fsutil.resolveLinkTarget(c.arena, canon_link_dir, buf[0..n]);
-    const actual = try canonOrLexical(c, lexical_target);
-    const expected = try canonOrLexical(c, expected_target);
-    return std.mem.eql(u8, actual, expected);
-}
-
-fn canonOrLexical(c: *Context, path: []const u8) ![]const u8 {
-    return fsutil.canonicalizeExistingAncestor(c.arena, c.io, path) catch
-        std.fs.path.resolve(c.arena, &.{path});
-}
-
-/// True iff the symlink at `link_path` RESOLVES end-to-end (its target is
-/// reachable). Mirrors discovery's broken-symlink probe: only a successful
-/// follow-stat means the target resolves; ANY error (FileNotFound, SymLinkLoop,
-/// AccessDenied through the chain, ...) means the link is broken. Used by disable
-/// to reject a broken managed symlink as unsafe instead of removing it
-/// (spec "disable"/"Terms"; Finding #8).
-fn symlinkResolves(c: *Context, link_path: []const u8) !bool {
-    _ = std.Io.Dir.cwd().statFile(c.io, link_path, .{ .follow_symlinks = true }) catch return false;
-    return true;
 }
 
 fn dup(c: *Context, s: []const u8) []const u8 {
@@ -556,8 +533,8 @@ fn promoteRun(c: *Context, skill_name: []const u8, overwrite: bool) anyerror!Res
     // 2d. Preflight agent entries for this skill: any unsafe entry (real dir/file/
     //     broken/external/wrong-target symlink) fails BEFORE mutation (spec
     //     promote). Managed symlinks pointing at the import dir are relink targets.
-    const dest_canon = try canonOrLexical(c, dest_dir);
-    const import_canon = try canonOrLexical(c, import_dir);
+    const dest_canon = try managed_entry.canonicalize(c.arena, c.io, dest_dir);
+    const import_canon = try managed_entry.canonicalize(c.arena, c.io, import_dir);
     var relinks: std.ArrayList(types.Agent) = .empty;
     for ([_]types.Agent{ .claude_code, .codex }) |agent| {
         switch (try preflightPromoteAgent(c, skill_name, agent, dest_canon, import_canon)) {
@@ -664,15 +641,18 @@ fn preflightPromoteAgent(
     import_canon: []const u8,
 ) anyerror!result.Result(bool) {
     const link_path = try std.fs.path.join(c.arena, &.{ c.agentRoot(agent), skill_name });
-    const kind = try fsutil.classify(c.io, std.Io.Dir.cwd(), link_path);
-    switch (kind) {
+    switch (try managed_entry.classify(c.arena, c.io, link_path)) {
         .missing => return .{ .ok = false },
-        .symlink => {
-            if (try symlinkPointsAtCanon(c, link_path, import_canon)) return .{ .ok = true };
-            if (try symlinkPointsAtCanon(c, link_path, dest_canon)) return .{ .ok = false };
+        // A real dir/file or a broken (unresolvable) symlink is unsafe and fails
+        // before mutation (spec promote). A broken managed link is left untouched.
+        .real_directory, .real_file, .broken_symlink => return .{ .err = .{ .kind = .unsafe_agent_entry, .path = dup(c, link_path) } },
+        .symlink => |target| {
+            // The classifier already canonicalized `target`; the caller pre-
+            // canonicalized both expected targets, so compare with plain equality.
+            if (std.mem.eql(u8, target, import_canon)) return .{ .ok = true };
+            if (std.mem.eql(u8, target, dest_canon)) return .{ .ok = false };
             return .{ .err = .{ .kind = .unsafe_agent_entry, .path = dup(c, link_path) } };
         },
-        .directory, .file => return .{ .err = .{ .kind = .unsafe_agent_entry, .path = dup(c, link_path) } },
     }
 }
 
@@ -728,17 +708,21 @@ fn executeUnpromote(
     actions: *std.ArrayList(types.SkillAction),
 ) anyerror!void {
     const cwd = std.Io.Dir.cwd();
-    const dest_canon = try canonOrLexical(c, dest_dir);
+    const dest_canon = try managed_entry.canonicalize(c.arena, c.io, dest_dir);
 
     // Remove managed agent symlinks pointing at the canonical copy (spec
     // unpromote). Any OTHER agent entry (external/broken/real) is left untouched
-    // (spec "Filesystem Safety").
+    // (spec "Filesystem Safety"). The canonical copy still exists at this point,
+    // so a managed link to it resolves; the classifier reports it as `.symlink`
+    // with `target` canonicalized for direct comparison.
     for ([_]types.Agent{ .claude_code, .codex }) |agent| {
         const link_path = try std.fs.path.join(c.arena, &.{ c.agentRoot(agent), skill_name });
-        const kind = try fsutil.classify(c.io, cwd, link_path);
-        if (kind == .symlink and try symlinkPointsAtCanon(c, link_path, dest_canon)) {
-            try cwd.deleteFile(c.io, link_path);
-            try actions.append(c.arena, .{ .action = .remove_symlink, .agent = agent, .path = dup(c, link_path) });
+        switch (try managed_entry.classify(c.arena, c.io, link_path)) {
+            .symlink => |target| if (std.mem.eql(u8, target, dest_canon)) {
+                try cwd.deleteFile(c.io, link_path);
+                try actions.append(c.arena, .{ .action = .remove_symlink, .agent = agent, .path = dup(c, link_path) });
+            },
+            else => {},
         }
     }
 
@@ -962,19 +946,4 @@ fn setManifestPromoted(
     const out = try manifest_mod.toBytes(c.arena, m);
     try cwd.writeFile(c.io, .{ .sub_path = manifest_path, .data = out });
     try actions.append(c.arena, .{ .action = .write_manifest, .path = dup(c, manifest_path) });
-}
-
-/// True iff the symlink at `link_path` resolves to the same canonicalized path
-/// as `expected_canon` (which the caller has ALREADY canonicalized). Mirrors
-/// `symlinkPointsAt` but takes a pre-canonicalized expected target so the caller
-/// can reuse it across several link checks.
-fn symlinkPointsAtCanon(c: *Context, link_path: []const u8, expected_canon: []const u8) !bool {
-    const cwd = std.Io.Dir.cwd();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = cwd.readLink(c.io, link_path, &buf) catch return false;
-    const link_dir = std.fs.path.dirname(link_path) orelse ".";
-    const canon_link_dir = try canonOrLexical(c, link_dir);
-    const lexical_target = try fsutil.resolveLinkTarget(c.arena, canon_link_dir, buf[0..n]);
-    const actual = try canonOrLexical(c, lexical_target);
-    return std.mem.eql(u8, actual, expected_canon);
 }
