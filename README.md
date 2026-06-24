@@ -6,8 +6,9 @@ promoted third-party storage, imported draft storage, Claude Code skills, and
 Codex skills.
 
 The product contract and data model are defined in
-[`cli-clean-room-spec.md`](./cli-clean-room-spec.md); the implementation plan and
-Zig-specific notes live in [`zig-clean-room-cli.md`](./zig-clean-room-cli.md).
+[`docs/cli-clean-room-spec.md`](./docs/cli-clean-room-spec.md); the
+implementation plan and Zig-specific notes live in
+[`docs/plans/000-zig-clean-room-cli.md`](./docs/plans/000-zig-clean-room-cli.md).
 This README is a usage and build reference — the spec is normative where they
 disagree.
 
@@ -216,6 +217,6 @@ build.zig.zon      # package manifest; pins minimum_zig_version 0.16.0
 Makefile           # build / test / fmt-check / check / run-list / run-tui
 .github/workflows/ # CI: pinned Zig 0.16.0 + fmt-check + test
 src/               # CLI source and tests (root_test.zig is the test entry)
-cli-clean-room-spec.md   # normative product contract and data model
-zig-clean-room-cli.md    # implementation plan and Zig 0.16 notes
+docs/cli-clean-room-spec.md   # normative product contract and data model
+docs/plans/                   # implementation plan + follow-up TDD plans
 ```
