@@ -26,6 +26,7 @@ const ops = @import("ops.zig");
 const json_out = @import("json_out.zig");
 const net = @import("net.zig");
 const git = @import("git.zig");
+const analyzer = @import("analyzer.zig");
 
 pub fn main(init: std.process.Init) !void {
     const code = run(init) catch |err| {
@@ -65,6 +66,16 @@ fn run(init: std.process.Init) !u8 {
             return failMsg(io, "tui does not support --format json");
         }
         return failMsg(io, "TUI not implemented");
+    }
+
+    // --- render-analysis-report operates on explicit paths only (no roots,
+    // no HOME), so handle it before root resolution. Non-spec extension. ---
+    if (parsed.command == .render_analysis_report) {
+        const c = parsed.command.render_analysis_report;
+        switch (analyzer.renderReportFile(arena, io, c.input, c.output)) {
+            .ok => return renderReportOk(io, parsed.format, c.output),
+            .err => |e| return fail(io, arena, e),
+        }
     }
 
     // --- resolve roots ---
@@ -145,8 +156,25 @@ fn dispatch(
             const r = ops.delete(&ctx, c.skill);
             return renderResult(io, arena, parsed.format, r, json_out.writeSkillOperationResult, textOperation);
         },
+        .render_analysis_report => unreachable, // handled in `run`
         .tui => unreachable, // handled in `run`
     }
+}
+
+/// Emit the `render-analysis-report` success line. Text: a short confirmation;
+/// JSON: a stable `{"output": "<path>"}` object with one trailing newline. (The
+/// launch script invokes this command without `--format`, so JSON is cosmetic.)
+fn renderReportOk(io: std.Io, format: cli.Format, output: []const u8) !u8 {
+    var buf: [4096]u8 = undefined;
+    var fw = std.Io.File.stdout().writer(io, &buf);
+    const w = &fw.interface;
+    switch (format) {
+        .json => try std.json.Stringify.value(.{ .output = output }, json_out.json_options, w),
+        .text => try w.print("wrote {s}", .{output}),
+    }
+    try w.writeByte('\n');
+    try w.flush();
+    return 0;
 }
 
 // --- context builders -------------------------------------------------------
@@ -309,6 +337,9 @@ fn kindMessage(kind: result.ErrorKind) []const u8 {
         .git_unavailable => "git is not available",
         .repository_error => "failed to process the repository",
         .enabled_import => "the import is enabled; disable it first",
+        .malformed_report => "the analysis report JSON is malformed",
+        .report_input_invalid => "the analysis report input is not a readable regular file",
+        .report_output_exists => "the analysis report output already exists",
         .io_error => "a filesystem operation failed",
         .out_of_memory => "out of memory",
     };

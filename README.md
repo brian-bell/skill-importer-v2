@@ -92,6 +92,7 @@ skill-importer [global-options] disable   --skill NAME --agent claude-code|codex
 skill-importer [global-options] promote   --skill NAME [--overwrite]
 skill-importer [global-options] unpromote --skill NAME
 skill-importer [global-options] delete    --skill NAME
+skill-importer [global-options] render-analysis-report --input PATH --output PATH
 skill-importer [global-options] tui
 ```
 
@@ -121,10 +122,16 @@ skill-importer [global-options] tui
 - `unpromote` — remove the canonical copy and managed symlinks, marking the
   import an unpromoted draft.
 - `delete` — remove an unpromoted, non-enabled imported draft.
+- `render-analysis-report` — **non-spec extension** (not part of
+  `cli-clean-room-spec.md`). Read a skill-analysis report JSON from `--input`,
+  render it to a self-contained HTML document, and write it to `--output`. The
+  input must be a regular file (symlinks are refused) and the output is created
+  fresh (an existing file is never overwritten). Operates on explicit paths only:
+  it needs no roots and no `HOME`.
 
-`--skill`, `--path`, `--url`, `--repository`, and `--source-location` are
-single-value options; `--agent` and `--select` are repeatable; `--overwrite` is
-a flag.
+`--skill`, `--path`, `--url`, `--repository`, `--source-location`, `--input`, and
+`--output` are single-value options; `--agent` and `--select` are repeatable;
+`--overwrite` is a flag.
 
 ### Exit codes
 

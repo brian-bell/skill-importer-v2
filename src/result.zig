@@ -60,6 +60,11 @@ pub const ErrorKind = enum {
     // --- delete-specific (spec "delete") ---
     enabled_import,
 
+    // --- analyzer (non-spec extension; see analyzer.zig) ---
+    malformed_report,
+    report_input_invalid,
+    report_output_exists,
+
     // --- unexpected I/O surfacing partial actions (spec "Filesystem Safety") ---
     io_error,
 

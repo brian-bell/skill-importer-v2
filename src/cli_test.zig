@@ -238,3 +238,27 @@ test "flag missing its value is parse error" {
     const r = parse(arena_s.allocator(), &.{"--format"});
     try testing.expect(!r.isOk());
 }
+
+// Non-spec extension: `render-analysis-report --input PATH --output PATH`.
+test "parse render-analysis-report with input and output" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const p = parse(arena_s.allocator(), &.{ "render-analysis-report", "--input", "r.json", "--output", "r.html" }).ok;
+    try testing.expect(p.command == .render_analysis_report);
+    try testing.expectEqualStrings("r.json", p.command.render_analysis_report.input);
+    try testing.expectEqualStrings("r.html", p.command.render_analysis_report.output);
+}
+
+test "render-analysis-report requires --input" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const r = parse(arena_s.allocator(), &.{ "render-analysis-report", "--output", "r.html" });
+    try testing.expect(!r.isOk());
+}
+
+test "render-analysis-report requires --output" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const r = parse(arena_s.allocator(), &.{ "render-analysis-report", "--input", "r.json" });
+    try testing.expect(!r.isOk());
+}

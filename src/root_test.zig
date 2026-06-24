@@ -33,4 +33,6 @@ comptime {
     _ = @import("cli_test.zig");
     _ = @import("cli_integration_test.zig");
     _ = @import("error_message_test.zig");
+    _ = @import("analyzer.zig");
+    _ = @import("analyzer_test.zig");
 }

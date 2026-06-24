@@ -79,3 +79,29 @@ test "errorMessage: git_unavailable names the repository" {
     try testing.expect(std.mem.indexOf(u8, msg, "https://example.test/skills.git") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "git not installed") != null);
 }
+
+// Non-spec analyzer: a malformed report names the input path and the reason.
+test "errorMessage: malformed_report names the path and reason" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    const msg = try render(arena, .{
+        .kind = .malformed_report,
+        .path = "/tmp/report.json",
+        .reason = "UnexpectedEndOfInput",
+    });
+    try testing.expect(std.mem.indexOf(u8, msg, "/tmp/report.json") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "UnexpectedEndOfInput") != null);
+}
+
+// Non-spec analyzer: refusing to overwrite names the output path.
+test "errorMessage: report_output_exists names the output path" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const msg = try render(arena_s.allocator(), .{
+        .kind = .report_output_exists,
+        .path = "/tmp/index.html",
+    });
+    try testing.expect(std.mem.indexOf(u8, msg, "/tmp/index.html") != null);
+}

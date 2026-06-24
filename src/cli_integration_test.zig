@@ -993,3 +993,51 @@ test "end-to-end lifecycle: import->promote->enable->disable->unpromote->delete 
         try testing.expect(!try importDirExists(arena, &tr, "life"));
     }
 }
+
+// Non-spec analyzer: `render-analysis-report` reads a report JSON and writes HTML.
+// Needs NO roots and NO HOME, so it runs under the empty-env harness unchanged.
+test "render-analysis-report writes HTML from a valid report, exit 0" {
+    const gpa = testing.allocator;
+    var tr = try tu.TmpRoots.init(gpa);
+    defer tr.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    const report =
+        \\{"skill_name":"demo","summary":"s","walkthrough":[{"title":"t","body":"b"}],
+        \\"security_findings":[{"severity":"high","title":"ti","detail":"de","recommendation":"re"}],
+        \\"residual_risks":["risk"]}
+    ;
+    try tr.dir().writeFile(io, .{ .sub_path = "report.json", .data = report });
+    const input = try std.fs.path.join(arena, &.{ tr.base, "report.json" });
+    const output = try std.fs.path.join(arena, &.{ tr.base, "index.html" });
+
+    var run = try runCli(gpa, &.{ "render-analysis-report", "--input", input, "--output", output });
+    defer run.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), run.code);
+
+    const html = try tr.dir().readFileAlloc(io, "index.html", arena, .unlimited);
+    try testing.expect(std.mem.indexOf(u8, html, "<h1>demo</h1>") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<div class=\"severity\">high</div>") != null);
+}
+
+// Non-spec analyzer: malformed report JSON exits 1 with actionable stderr.
+test "render-analysis-report with malformed JSON exits 1 with stderr" {
+    const gpa = testing.allocator;
+    var tr = try tu.TmpRoots.init(gpa);
+    defer tr.deinit();
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    try tr.dir().writeFile(io, .{ .sub_path = "bad.json", .data = "{ not json" });
+    const input = try std.fs.path.join(arena, &.{ tr.base, "bad.json" });
+    const output = try std.fs.path.join(arena, &.{ tr.base, "out.html" });
+
+    var run = try runCli(gpa, &.{ "render-analysis-report", "--input", input, "--output", output });
+    defer run.deinit(gpa);
+    try testing.expectEqual(@as(u8, 1), run.code);
+    try testing.expect(std.mem.indexOf(u8, run.stderr, "skill-importer:") != null);
+    try testing.expect(std.mem.indexOf(u8, run.stderr, "malformed") != null);
+}

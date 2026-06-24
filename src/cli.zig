@@ -37,6 +37,8 @@ pub const Command = union(enum) {
     promote: struct { skill: []const u8, overwrite: bool },
     unpromote: struct { skill: []const u8 },
     delete: struct { skill: []const u8 },
+    /// Non-spec extension (analyzer.zig): render a Codex report JSON to HTML.
+    render_analysis_report: struct { input: []const u8, output: []const u8 },
     tui,
 };
 
@@ -128,6 +130,11 @@ pub fn parse(arena: std.mem.Allocator, args: []const []const u8) Result {
             };
         } else if (std.mem.eql(u8, cmd_word, "delete")) {
             break :blk switch (parseSkillOnly(rest, .delete)) {
+                .ok => |c| c,
+                .err => |e| return .{ .err = e },
+            };
+        } else if (std.mem.eql(u8, cmd_word, "render-analysis-report")) {
+            break :blk switch (parseRenderAnalysisReport(rest)) {
                 .ok => |c| c,
                 .err => |e| return .{ .err = e },
             };
@@ -288,6 +295,25 @@ fn parseSkillOnly(opts: []const []const u8, kind: SkillOnlyKind) CmdResult {
         .unpromote => .{ .ok = .{ .unpromote = .{ .skill = s } } },
         .delete => .{ .ok = .{ .delete = .{ .skill = s } } },
     };
+}
+
+/// `render-analysis-report --input PATH --output PATH` (both required, singletons;
+/// last value wins like the other singleton parsers). Non-spec extension.
+fn parseRenderAnalysisReport(opts: []const []const u8) CmdResult {
+    var input: ?[]const u8 = null;
+    var output: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < opts.len) : (i += 1) {
+        const tok = opts[i];
+        if (std.mem.eql(u8, tok, "--input")) {
+            input = nextValue(opts, &i) orelse return optNeedsValue("--input");
+        } else if (std.mem.eql(u8, tok, "--output")) {
+            output = nextValue(opts, &i) orelse return optNeedsValue("--output");
+        } else return unknownOpt();
+    }
+    const in = input orelse return .{ .err = .{ .kind = .parse_error, .reason = "render-analysis-report requires --input PATH" } };
+    const out = output orelse return .{ .err = .{ .kind = .parse_error, .reason = "render-analysis-report requires --output PATH" } };
+    return .{ .ok = .{ .render_analysis_report = .{ .input = in, .output = out } } };
 }
 
 fn unknownOpt() CmdResult {
