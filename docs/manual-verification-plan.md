@@ -637,16 +637,19 @@ unavailable (note which in the sign-off table).
 
 | Section | Pass / Fail / N/A | Notes |
 | ------- | ----------------- | ----- |
-| 3 Global parsing | | |
-| 4 import markdown | | |
-| 5 import url (live) | | |
-| 6 import path | | |
-| 7 import repository | | |
-| 8 enable / disable | | |
-| 9 promote / unpromote / delete | | |
-| 10 root resolution | | |
-| 11 non-spec (render / analyze / tui) | | |
-| 12 list integration | | |
-| 13 output contract | | |
+| 3 Global parsing | Pass | 11/11 |
+| 4 import markdown | Pass | 11/11 |
+| 5 import url (live) | Pass | 6/6 (in-process HTTP server; 5.3/5.6 always run) |
+| 6 import path | Pass | 9/9 |
+| 7 import repository | Pass | 12/12 deterministic; 7.13 (live git URL) N/A — no `--git-url`; 7.12 (batch rollback) INDETERMINATE — postcondition asserted, mid-write rollback not externally forceable |
+| 8 enable / disable | Pass | 14/14 |
+| 9 promote / unpromote / delete | Pass | 19/19 deterministic; 9.11 (overwrite safety) INDETERMINATE — happy path only, mid-copy failure not simulable externally |
+| 10 root resolution | Pass | 7/7 |
+| 11 non-spec (render / analyze / tui) | Pass | 12/12 deterministic; macOS build so 11.2a N/A; 11.2d (real `codex exec` launch) INDETERMINATE — verify by hand |
+| 12 list integration | Pass | 9/9 |
+| 13 output contract | Pass | Cross-cutting assertions enforced per case; no real user root touched (sandbox `HOME` + all four roots) |
 
-Tester: __________   Binary SHA (`git rev-parse HEAD`): __________   Date: __________
+Verified via the `verify-skill-importer` harness: `plan=115 run=115` (no
+missing/extra case ids), **0 FAIL**, 2 N/A, 3 INDETERMINATE.
+
+Tester: verify-skill-importer harness (run by Brian Bell)   Binary SHA (`git rev-parse HEAD`): fc6485b077684a86d1e3f265d1ab50f4e3625723   Binary content hash: sha256:0e5d5aebdda38120c15d99858acbfd99170332f19da87dea7810dba28cb8ee81   Date: 2026-06-24
