@@ -496,7 +496,14 @@ pub fn renderLaunchScript(arena: std.mem.Allocator, plan: LaunchPlan) ![]const u
     try w.writeAll(try shellQuote(arena, plan.codex_profile_name));
     try w.writeAll(" -C ");
     try w.writeAll(try shellQuote(arena, plan.workspace_dir));
-    try w.writeAll(" exec --ephemeral --ignore-rules --skip-git-repo-check --output-schema ");
+    // `--ignore-user-config` is essential to the isolation boundary: `-p` layers
+    // the analyzer profile ON TOP of `$CODEX_HOME/config.toml`, so without this
+    // the user's base config (MCP servers, plugins, permissive sandbox/network
+    // settings) would still be active while the model reads UNTRUSTED skill
+    // content — a prompt-injection lever. Per `codex exec --help`, the flag drops
+    // config.toml but auth still resolves from CODEX_HOME, so it does not break
+    // the keychain/auth flow.
+    try w.writeAll(" exec --ignore-user-config --ephemeral --ignore-rules --skip-git-repo-check --output-schema ");
     try w.writeAll(try shellQuote(arena, plan.output_schema_path));
     try w.writeAll(" --output-last-message ");
     try w.writeAll(try shellQuote(arena, plan.report_json_path));

@@ -378,7 +378,10 @@ test "renderLaunchScript uses an isolated environment and the renderer path" {
     try expectContains(script, "export CODEX_HOME='/Users/brian/.codex'");
     try expectContains(script, "rm -f '/Users/brian/.codex/skill-importer-analysis-demo.config.toml'");
     try expectContains(script, "if ! \"$@\" /bin/sh -c 'command -v codex");
-    try expectContains(script, "codex -a untrusted -p 'skill-importer-analysis-demo' -C '/tmp/analysis/work space' exec --ephemeral --ignore-rules --skip-git-repo-check --output-schema '/tmp/analysis/work space/report schema.json' --output-last-message '/tmp/analysis/report/report.json'");
+    try expectContains(script, "codex -a untrusted -p 'skill-importer-analysis-demo' -C '/tmp/analysis/work space' exec --ignore-user-config --ephemeral --ignore-rules --skip-git-repo-check --output-schema '/tmp/analysis/work space/report schema.json' --output-last-message '/tmp/analysis/report/report.json'");
+    // The user's base config.toml must be ignored so MCP servers / permissive
+    // settings cannot layer under the analyzer profile while reading untrusted skill content.
+    try expectContains(script, "--ignore-user-config");
     try expectContains(script, "render-analysis-report");
     try expectContains(script, "\"$@\" '/Applications/skill importer/bin'\\''s/skill-importer' render-analysis-report");
     try expectContains(script, "\"$@\" /usr/bin/open '/tmp/analysis/report/index.html'");
