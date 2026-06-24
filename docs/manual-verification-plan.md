@@ -446,7 +446,175 @@ A final pass confirming the cross-cutting contract from spec "Output Contract":
 
 ---
 
-## 14. Sign-off
+## 14. Master checklist
+
+Tick each box as the case passes. Every case from §3–§13 is listed once, in
+order. Mark live/platform-gated cases **N/A** when their preconditions are
+unavailable (note which in the sign-off table).
+
+### Prerequisites & setup (§1–§2)
+
+- [ ] `zig version` → `0.16.0`
+- [ ] `make build` produces `zig-out/bin/skill-importer`; `BIN` exported
+- [ ] `make check` (fmt + tests) green before manual work
+- [ ] `reset_lab`, `si`, `mk_skill_md`, `mk_canonical` helpers defined; lab created
+
+### §3 Global parsing & smoke
+
+- [ ] 3.1 `list` empty → exit 0, `no skills found`
+- [ ] 3.2 `--format json list` → `{"skills":[],"source_repositories":[]}`
+- [ ] 3.3 json output ends in `0a` (single trailing newline)
+- [ ] 3.4 no args → exit 1, `missing command`
+- [ ] 3.5 `bogus` → exit 1, `unknown command`
+- [ ] 3.6 `--format xml` → exit 1, invalid format
+- [ ] 3.7 `--format` no value → exit 1
+- [ ] 3.8 `--bogus-root` → exit 1, unknown global option
+- [ ] 3.9 `list --extra` → exit 1, `command takes no options`
+- [ ] 3.10 `--format json bogus` → exit 1 (parse error regardless of format)
+- [ ] 3.11 `list --format json` (format after command) → exit 1 (global must precede command)
+
+### §4 import markdown
+
+- [ ] 4.1 happy → exit 0, correct manifest + actions
+- [ ] 4.2 fs: `SKILL.md` + `import.json`, 2-space indent, no trailing newline
+- [ ] 4.3 no `--source-location` → `source_location` null/absent
+- [ ] 4.4 missing open delimiter → exit 1, no storage
+- [ ] 4.5 missing close delimiter → exit 1, no storage
+- [ ] 4.6 missing name → exit 1
+- [ ] 4.7 bad name (separator) → exit 1
+- [ ] 4.8 bad name (`..`) → exit 1
+- [ ] 4.9 missing description → exit 1
+- [ ] 4.10 collision on re-import → exit 1, first untouched
+- [ ] 4.11 no partial storage after any failure
+
+### §5 import url (live network)
+
+- [ ] 5.1 happy fetch → exit 0, `source_type=url`
+- [ ] 5.2 bad name in body → exit 1, no storage
+- [ ] 5.3 404 / unreachable → exit 1, `failed to fetch the URL`
+- [ ] 5.4 non-UTF8 → exit 1, no storage
+- [ ] 5.5 > 1 MiB → exit 1, `exceeded the maximum allowed size`
+- [ ] 5.6 missing `--url` → exit 1
+
+### §6 import path
+
+- [ ] 6.1 single markdown file → exit 0, `source_type=local_path`
+- [ ] 6.2 missing `--path` → exit 1
+- [ ] 6.3 nonexistent path → exit 1
+- [ ] 6.4 directory happy: support files copied, `copy_file` actions
+- [ ] 6.5 dir without `SKILL.md` → exit 1, no storage
+- [ ] 6.6 symlink inside source rejected → exit 1
+- [ ] 6.7 reserved `import.json` in source → exit 1
+- [ ] 6.8 imports root inside source → exit 1
+- [ ] 6.9 collision on re-import → exit 1
+
+### §7 import repository
+
+- [ ] 7.1 root skill → `kind=imported`, `skill_path="."`
+- [ ] 7.2 selection (multi, no select) → `kind=selection`, no storage
+- [ ] 7.3 single `--select` → `kind=imported`
+- [ ] 7.4 batch `--select`×2 → `kind=imported_batch`, length 2
+- [ ] 7.5 duplicate selection → exit 1
+- [ ] 7.6 duplicate resolved name → exit 1
+- [ ] 7.7 missing selection → exit 1
+- [ ] 7.8 empty repo → exit 1
+- [ ] 7.9 invalid root `SKILL.md` → exit 1 (fail, not skip)
+- [ ] 7.10 depth limit (skill at depth 9) → exit 1; depth ≤8 found
+- [ ] 7.11 imports-root collision → exit 1 before any write
+- [ ] 7.12 batch rollback: later write fails → no earlier write survives
+- [ ] 7.13 git URL (live) → clones depth 1
+- [ ] 7.14 git unavailable → exit 1, `git is not available`
+
+### §8 enable / disable
+
+- [ ] 8.1 enable one agent → `create_symlink`, symlink correct
+- [ ] 8.2 idempotent → `skip_unchanged`
+- [ ] 8.3 two agents → ordered actions, both symlinks
+- [ ] 8.4 dedupe first-seen order
+- [ ] 8.5 unknown skill → exit 1, no symlink
+- [ ] 8.6 missing `--agent` → exit 1
+- [ ] 8.7 bad agent value → exit 1
+- [ ] 8.8 unsafe entry (real dir) → exit 1, intact
+- [ ] 8.9 atomic preflight: later unsafe → earlier agent NOT mutated
+- [ ] 8.10 disable one → `remove_symlink`, gone
+- [ ] 8.11 disable missing → `skip_unchanged`
+- [ ] 8.12 disable unsafe (external symlink) → exit 1, intact
+- [ ] 8.13 agent-only enable → exit 1
+- [ ] 8.14 unpromoted import enable → exit 1
+
+### §9 promote / unpromote / delete
+
+- [ ] 9.1 promote happy: canonical written, `import.json` excluded, manifest `promoted=true`
+- [ ] 9.2 already promoted → exit 1
+- [ ] 9.3 unknown → exit 1
+- [ ] 9.4 canonical-only → exit 1
+- [ ] 9.5 collision no overwrite → exit 1
+- [ ] 9.6 `--overwrite` → exit 0, replaced
+- [ ] 9.7 overwrite name mismatch → exit 1 (fails even with overwrite)
+- [ ] 9.8 frontmatter name collision elsewhere → exit 1
+- [ ] 9.9 unsupported import entry (symlink) → exit 1
+- [ ] 9.10 relink managed import symlinks to canonical copy
+- [ ] 9.11 overwrite safety: old copy intact until replacement valid
+- [ ] 9.12 unpromote happy: canonical removed, manifest `promoted=false`, agent symlinks removed
+- [ ] 9.13 unpromote not promoted → exit 1
+- [ ] 9.14 unpromote canonical-only → exit 1
+- [ ] 9.15 unpromote unknown → exit 1
+- [ ] 9.16 delete happy: imports dir removed
+- [ ] 9.17 delete promoted → exit 1 (unpromote first)
+- [ ] 9.18 delete enabled → exit 1 (disable first)
+- [ ] 9.19 delete canonical/agent-only → exit 1
+- [ ] 9.20 delete leaves unrelated same-name agent entry untouched
+
+### §10 Root resolution
+
+- [ ] 10.1 all roots explicit, no HOME → exit 0
+- [ ] 10.2 default needs HOME, unset → exit 1
+- [ ] 10.3 relative HOME → exit 1
+- [ ] 10.4 `AGENT_SKILLS_REPO` → canonical `<asr>/third-party`
+- [ ] 10.5 HOME-derived canonical `<home>/dev/agent-skills/third-party`
+- [ ] 10.6 runtime-root marker detection for imports default
+- [ ] 10.7 missing roots → empty inventory, exit 0
+
+### §11 Non-spec extensions
+
+- [ ] 11.1a render happy → exit 0, html written
+- [ ] 11.1b render `--format json` → `{"output":"<path>"}`
+- [ ] 11.1c render missing `--input` → exit 1
+- [ ] 11.1d render input not a regular file → exit 1
+- [ ] 11.1e render output exists → exit 1
+- [ ] 11.1f render malformed report → exit 1
+- [ ] 11.1g render needs no HOME → exit 0
+- [ ] 11.2a analyze non-macOS → exit 1, `supported only on macOS`
+- [ ] 11.2b analyze codex missing → exit 1
+- [ ] 11.2c analyze file-backed auth → exit 1
+- [ ] 11.2d analyze happy (macOS) → exit 0, launches `codex exec`
+- [ ] 11.3a `tui` → exit 1, `TUI not implemented`
+- [ ] 11.3b `tui --format json` → exit 1, `does not support --format json`
+- [ ] 11.3c `tui --extra` → exit 1, `command takes no options`
+
+### §12 list integration
+
+- [ ] 12.1 skills sorted ascending by name
+- [ ] 12.2 canonical entry: `source`, `agent_entries`, `enablement` correct
+- [ ] 12.3 imported entry: `source=imported`, `promoted=false`
+- [ ] 12.4 broken symlink → `broken_symlink`, enablement false
+- [ ] 12.5 external symlink → `external_symlink`, enablement true
+- [ ] 12.6 promoted+enabled re-list reflects state
+- [ ] 12.7 repository skill grouped in `source_repositories`
+- [ ] 12.8 malformed `import.json` → exit 1 (not silent skip)
+- [ ] 12.9 every json output parses, UTF-8, one trailing newline
+
+### §13 Output-contract sweep
+
+- [ ] every json success → valid UTF-8 JSON, one trailing `\n`
+- [ ] every failure → exit 1, empty stdout, `skill-importer: <message>` stderr
+- [ ] every failure message names operation + skill/path/url/repository
+- [ ] no real user root mutated during the run
+- [ ] action lists use only the documented action vocabulary
+
+---
+
+## 15. Sign-off
 
 | Section | Pass / Fail / N/A | Notes |
 | ------- | ----------------- | ----- |
