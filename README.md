@@ -52,6 +52,16 @@ The built binary is written to `./zig-out/bin/skill-importer`. The test suite is
 the primary oracle: the integration tests exec the real binary against
 **disposable temp roots only** — never real user roots.
 
+For end-to-end **acceptance** checking,
+[`docs/manual-verification-plan.md`](./docs/manual-verification-plan.md) is a
+115-case black-box checklist that drives the built binary with the real net/git
+providers. The bundled `verify-skill-importer` skill runs it for you against
+disposable sandbox roots (no real user root is touched):
+
+```sh
+python3 .claude/skills/verify-skill-importer/harness/run.py
+```
+
 CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) pins Zig to 0.16.0
 and runs `zig fmt --check src` and `zig build test` on every push to `main` and
 on every pull request.
@@ -218,5 +228,7 @@ Makefile           # build / test / fmt-check / check / run-list / run-tui
 .github/workflows/ # CI: pinned Zig 0.16.0 + fmt-check + test
 src/               # CLI source and tests (root_test.zig is the test entry)
 docs/cli-clean-room-spec.md   # normative product contract and data model
+docs/manual-verification-plan.md  # 115-case black-box acceptance checklist
 docs/plans/                   # implementation plan + follow-up TDD plans
+.claude/skills/verify-skill-importer/  # Python harness that runs the checklist
 ```

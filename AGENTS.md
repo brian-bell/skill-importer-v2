@@ -45,6 +45,25 @@ runs `zig fmt --check src` + `zig build test` on pushes to `main` and on PRs.
 `git` is only needed at runtime for `import repository` against Git URLs; the
 test suite never shells out to it (the provider is injected).
 
+### Acceptance verification
+
+`zig build test` is hermetic (injected providers, temp roots). For **black-box**
+acceptance, [`docs/manual-verification-plan.md`](./docs/manual-verification-plan.md)
+is a 115-case checklist that drives the real built binary with the real
+net/git providers. The `verify-skill-importer` skill
+(`.claude/skills/verify-skill-importer/`) runs it automatically: a dependency-free
+Python harness (stdlib only) builds the binary, exercises every case against
+disposable `mktemp` sandbox roots — all four roots **and** `HOME` overridden, so
+no real user root is ever touched — and prints per-section PASS / FAIL / N-A /
+INDETERMINATE, a machine-readable `SUMMARY`, an id-coverage diff against the plan,
+and a binary content hash for sign-off. Run it with
+`python3 .claude/skills/verify-skill-importer/harness/run.py` (or
+`/verify-skill-importer`); env-gated sections (url, git, macOS `analyze`)
+auto-detect and mark N-A when unavailable. The harness's own unit tests are
+`python3 -m unittest test_harness` from its `harness/` dir. Where the harness and
+plan disagree the plan (and the spec behind it) is normative, except two cases the
+case comments flag and the plan rows already reflect (§7.3, §7.10).
+
 ## Commands
 
 ```text
