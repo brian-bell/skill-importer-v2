@@ -226,8 +226,9 @@ test "import markdown rolls back and leaves no skill directory on a store failur
 // --- Finding #13: directory / repository imports must emit copy_file actions in
 // a DETERMINISTIC order, not raw readdir order, matching the deterministic-output
 // requirement (spec "Output Contract": deterministic; "import path": the
-// directory content hash sorts relative paths). copyDirRecording iterated in
-// filesystem order; this asserts the recorded copy_file action paths come out
+// directory content hash sorts relative paths). The shared recording_copy.copyTree
+// sorts entries before emitting (the original copier iterated in raw filesystem
+// order); this asserts the recorded copy_file action paths come out
 // sorted ascending (by name within each directory level). The fixture writes
 // supporting files in a deliberately UN-sorted creation order so a filesystem
 // that preserves creation order would expose the bug. ---

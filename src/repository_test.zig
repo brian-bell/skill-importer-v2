@@ -230,9 +230,10 @@ test "repository import: multi-file skill records copy_file per file, hash cover
 
 // --- Finding #13: a repository import must emit its copy_file actions in a
 // DETERMINISTIC order, not raw readdir order (spec "Output Contract":
-// deterministic; the content_hash already sorts relative paths). copyDirRecording
-// iterated in filesystem order; this asserts the recorded copy_file basenames in
-// each directory level come out sorted ascending. Files are created in a
+// deterministic; the content_hash already sorts relative paths). The shared
+// recording_copy.copyTree sorts entries before emitting (the original copier
+// iterated in raw filesystem order); this asserts the recorded copy_file basenames
+// in each directory level come out sorted ascending. Files are created in a
 // deliberately non-alphabetical order. ---
 
 test "repository import: copy_file actions are emitted in sorted (deterministic) order" {

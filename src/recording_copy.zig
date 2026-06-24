@@ -30,6 +30,8 @@ pub const Sink = struct {
 /// Decide whether to skip an entry by name. `at_top` is true only for entries
 /// directly under the copy root.
 pub const Exclude = struct {
+    // The known policies below are stateless, so `ctx` defaults to `undefined`
+    // and is never dereferenced. A future STATEFUL excluder MUST set `ctx`.
     ctx: *anyopaque = undefined,
     skipFn: *const fn (ctx: *anyopaque, name: []const u8, at_top: bool) bool,
     pub fn skip(self: Exclude, name: []const u8, at_top: bool) bool {
