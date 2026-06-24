@@ -33,6 +33,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_module.addOptions("build_options", build_options);
+    // Some POSIX-only tests call libc `mkfifo` via `extern "c"`. macOS links
+    // libSystem (libc) by default, but Linux requires it to be explicit, so
+    // link libc into the test module to keep `zig build test` portable.
+    test_module.link_libc = true;
 
     const tests = b.addTest(.{ .root_module = test_module });
     const run_tests = b.addRunArtifact(tests);
