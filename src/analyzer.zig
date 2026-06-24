@@ -206,6 +206,18 @@ pub fn shellQuote(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     return aw.written();
 }
 
+/// True if absolute `candidate` is `root` itself or lies inside it, compared by
+/// PATH COMPONENT — NOT raw byte prefix. `/a/skill` does NOT contain
+/// `/a/skill-evil` (v1 relies on Rust `Path::starts_with`, which is
+/// component-wise). `root` must be canonical with no trailing separator (a
+/// `realpath` guarantee for any non-root path), so a containment requires the
+/// next byte after `root` to be the path separator.
+pub fn pathWithin(root: []const u8, candidate: []const u8) bool {
+    if (!std.mem.startsWith(u8, candidate, root)) return false;
+    if (candidate.len == root.len) return true;
+    return candidate[root.len] == std.fs.path.sep;
+}
+
 /// Quote a value as an AppleScript string literal (v1 `applescript_quote`):
 /// wrap in double quotes, escaping `\` and `"`. Used to embed the `sh <script>`
 /// command inside the `osascript` Terminal launch.

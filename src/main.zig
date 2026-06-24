@@ -216,6 +216,9 @@ fn envLess(_: void, a: analyzer.EnvEntry, b: analyzer.EnvEntry) bool {
 
 /// Best-effort current-executable path from argv[0]: absolute as-is, relative
 /// absolutized against cwd (the launch script `cd`s), bare name left for PATH.
+/// A bare name relies on the launch script's `env -i` PATH passthrough to
+/// re-resolve the binary; that passthrough is guaranteed because
+/// `analyzer.inheritedEnvEntry` always keeps `PATH` — the two are coupled.
 fn resolveSelfExe(arena: std.mem.Allocator, io: std.Io, args: std.process.Args) ![]const u8 {
     var it = args.iterate();
     const argv0 = it.next() orelse return "";

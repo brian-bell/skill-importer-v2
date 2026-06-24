@@ -227,6 +227,20 @@ test "buildAnalysisPrompt frames files as untrusted and covers the security chec
     try testing.expect(std.mem.indexOf(u8, prompt, "report.json") == null);
 }
 
+test "pathWithin compares by component, not byte prefix" {
+    // A child is contained.
+    try testing.expect(analyzer.pathWithin("/a/skill", "/a/skill/SKILL.md"));
+    try testing.expect(analyzer.pathWithin("/a/skill", "/a/skill/sub/file"));
+    // The root itself counts as within.
+    try testing.expect(analyzer.pathWithin("/a/skill", "/a/skill"));
+    // A SIBLING that merely shares a byte prefix is NOT contained (the escape bug).
+    try testing.expect(!analyzer.pathWithin("/a/skill", "/a/skill-evil/secret"));
+    try testing.expect(!analyzer.pathWithin("/a/skill", "/a/skillX"));
+    // Unrelated paths.
+    try testing.expect(!analyzer.pathWithin("/a/skill", "/b/other"));
+    try testing.expect(!analyzer.pathWithin("/a/skill", "/a"));
+}
+
 test "shellQuote handles empty, plain, and embedded metacharacters" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

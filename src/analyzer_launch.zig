@@ -124,7 +124,10 @@ fn analyzeImpl(c: *Context, spawner: Spawner, skill_name: []const u8) anyerror!R
     }
 
     // 6. Refuse file-backed Codex auth: it would expose reusable credentials to
-    //    the analyzed (untrusted) skill (v1 reject_file_backed_codex_auth).
+    //    the analyzed (untrusted) skill (v1 reject_file_backed_codex_auth). The
+    //    no-follow classify is intentionally stricter than v1's `Path::exists`
+    //    (which follows): a BROKEN auth.json symlink is also refused here, erring
+    //    toward safety for a credentials check.
     {
         const auth = try std.fs.path.join(c.arena, &.{ c.codex_home, "auth.json" });
         const kind = fsutil.classify(c.io, cwd, auth) catch fsutil.EntryKind.missing;
@@ -237,27 +240,41 @@ fn copyDirChecked(c: *Context, source: []const u8, dest: []const u8, root: []con
     while (try it.next(c.io)) |entry| {
         const src_path = try std.fs.path.join(c.arena, &.{ source, entry.name });
         const dst_path = try std.fs.path.join(c.arena, &.{ dest, entry.name });
-        switch (try fsutil.classify(c.io, cwd, src_path)) {
+        // Stat the entry's REAL kind (no-follow). `fsutil.classify` collapses
+        // every non-dir/non-symlink kind to `.file`, which would feed a fifo or
+        // device node to `readFileAlloc` and BLOCK FOREVER on untrusted input;
+        // switch on the precise kind and ignore anything but regular files,
+        // directories, and symlinks (v1 copies only `is_file`, ignores the rest).
+        const st = cwd.statFile(c.io, src_path, .{ .follow_symlinks = false }) catch continue;
+        switch (st.kind) {
             .file => try copyFileBytes(c, src_path, dst_path),
             .directory => try copyDirChecked(c, src_path, dst_path, root),
-            .symlink => {
-                // Canonicalize the target; a broken link or one escaping the
-                // skill directory is refused.
+            .sym_link => {
+                // Canonicalize the target; a broken link, a link whose target
+                // ESCAPES the skill directory (component-wise; a sibling like
+                // `<root>-evil` does NOT count as inside), or a symlinked
+                // directory is refused. An in-tree symlinked file is copied by
+                // content (v1 copy_dir_checked).
                 const target = cwd.realPathFileAlloc(c.io, src_path, c.arena) catch return error.UnsupportedEntry;
-                if (!std.mem.startsWith(u8, target, root)) return error.UnsupportedEntry;
-                const st = cwd.statFile(c.io, target, .{ .follow_symlinks = true }) catch return error.UnsupportedEntry;
-                switch (st.kind) {
+                if (!analyzer.pathWithin(root, target)) return error.UnsupportedEntry;
+                const tst = cwd.statFile(c.io, target, .{ .follow_symlinks = true }) catch return error.UnsupportedEntry;
+                switch (tst.kind) {
                     .directory => return error.UnsupportedEntry,
                     .file => try copyFileBytes(c, target, dst_path),
                     else => {},
                 }
             },
-            .missing => {},
+            else => {}, // fifo / socket / device / unknown: ignore (v1 parity)
         }
     }
 }
 
 fn copyFileBytes(c: *Context, src_path: []const u8, dst_path: []const u8) !void {
+    // Reads the whole (untrusted) file into the arena rather than streaming as
+    // v1's `fs::copy` does. A pathologically large in-tree file therefore spikes
+    // memory; that surfaces as a caught OOM with the partial workspace rolled
+    // back (degraded to an error, never a read hang or escape), not a vuln. Kept
+    // simple because real skill support files are small.
     const bytes = try std.Io.Dir.cwd().readFileAlloc(c.io, src_path, c.arena, .unlimited);
     try writeNew(c, dst_path, bytes);
 }
@@ -284,6 +301,10 @@ fn writeNew(c: *Context, path: []const u8, bytes: []const u8) !void {
     try fw.interface.flush();
 }
 
+/// Arena-copy for error payloads. The `catch s` fallback is lifetime-safe: every
+/// caller passes `skill_name`, which is borrowed from the arena-owned argv slice
+/// (main.zig collectArgs) and outlives the result, so on OOM returning the
+/// original borrow is sound rather than a use-after-free.
 fn dup(c: *Context, s: []const u8) []const u8 {
     return c.arena.dupe(u8, s) catch s;
 }
