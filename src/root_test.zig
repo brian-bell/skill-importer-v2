@@ -16,6 +16,8 @@ comptime {
     _ = @import("manifest_test.zig");
     _ = @import("hash_test.zig");
     _ = @import("fsutil_test.zig");
+    _ = @import("managed_entry.zig");
+    _ = @import("managed_entry_test.zig");
     _ = @import("discovery_test.zig");
     _ = @import("net.zig");
     _ = @import("net_test.zig");
