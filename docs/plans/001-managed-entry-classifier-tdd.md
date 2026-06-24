@@ -206,6 +206,12 @@ not external). This is the *entire point* of the consolidation — eliminating t
 hand-maintained agreement between the two copies. It is locked by a new `promote_test`
 case ("a dangling agent symlink pointing at the FUTURE canonical dest is unsafe").
 
+The same probe-before-match ordering also hardens `executeUnpromote` (a dangling link whose
+lexical target equals `dest_canon` is now left untouched rather than removed), but that path
+is **unreachable in practice**: unpromote runs only on a promoted skill, so the canonical
+copy exists and a managed link to it is not dangling. The change there is strictly safer and
+needs no separate test.
+
 ## 7. Risks & mitigations
 
 - **Subtle canonicalization divergence** between the two originals. Mitigation: migrate
