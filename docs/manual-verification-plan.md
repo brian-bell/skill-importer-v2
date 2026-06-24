@@ -34,7 +34,7 @@ The spec is normative. Where this plan and the spec disagree, the spec wins.
 | Zig 0.16.0  | `zig version` → `0.16.0` |
 | Build       | `make build` → produces `zig-out/bin/skill-importer` |
 | Suite green | `make check` (fmt + tests) passes before manual work |
-| `git` CLI   | needed only for the live `import repository` Git-URL case (§6.10) |
+| `git` CLI   | needed for all `import repository` cases — the provider always `git clone`s, even a local path, so fixtures must be real git repos (§7, esp. the live Git-URL case §7.13) |
 | macOS       | needed only for the live `analyze` case (§11.2) |
 | Network     | needed only for the live `import url` case (§5) |
 
@@ -220,34 +220,53 @@ printf 'support\n' > "$LAB/work/dir-skill/helpers/util.txt"
 
 ## 7. `import repository` (§ spec "import repository", "Collision Rules")
 
-`--repository` may be a local path or Git URL. Build local fixture repos so most
-cases need no network. Scan depth limit is **8**.
+`--repository` may be a local path or Git URL, but the provider **always shells
+`git clone`** — so a local fixture must be a real git repo, not a plain directory.
+After `mk_skill_md`, run `git -C "$DIR" init -q && git -C "$DIR" add -A && git -C
+"$DIR" -c user.email=v@v -c user.name=v commit -qm init`. Local fixtures need no
+network but do need the `git` CLI. Scan depth limit is **8**.
 
 ```sh
 reset_lab
 
+# Turn a directory of skills into a real git repo (the provider always clones).
+# GIT_CONFIG_GLOBAL/SYSTEM=/dev/null + core.hooksPath=/dev/null keep your global
+# git config and hooks out of the sandbox.
+git_repo() {
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$1" init -q
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$1" add -A
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$1" \
+    -c user.email=v@v -c user.name=v -c commit.gpgsign=false \
+    -c core.hooksPath=/dev/null commit -qm init
+}
+
 # Repo with ONE skill at root.
 mkdir -p "$LAB/work/repo-single"
 mk_skill_md "$LAB/work/repo-single/SKILL.md" root-skill 'root skill'
+git_repo "$LAB/work/repo-single"
 
 # Repo with MULTIPLE skills in subdirs.
 mkdir -p "$LAB/work/repo-multi"
 mk_skill_md "$LAB/work/repo-multi/alpha/SKILL.md" repo-alpha 'first'
 mk_skill_md "$LAB/work/repo-multi/beta/SKILL.md"  repo-beta  'second'
+git_repo "$LAB/work/repo-multi"
 ```
+
+Each later §7 case that builds its own fixture repo (7.6, 7.8–7.10) must call
+`git_repo` on it too before the `import repository` command.
 
 | # | Command | Expect |
 | - | ------- | ------ |
 | 7.1 root skill | `si --format json import repository --repository "$LAB/work/repo-single" \| jq .` | exit 0; `kind="imported"`; `manifest.source_type=repository`; `source_repository.skill_path="."`; `source_location` ends `#.` |
 | 7.2 selection | `si --format json import repository --repository "$LAB/work/repo-multi" \| jq .` | exit 0; `kind="selection"`; lists `repo-alpha`(`alpha`) and `repo-beta`(`beta`); **no storage written** (`ls $LAB/imports` empty) |
-| 7.3 single select | `si --format json import repository --repository "$LAB/work/repo-multi" --select alpha \| jq .` | exit 0; `kind="imported"`; `skill_name=repo-alpha` |
+| 7.3 single select | `si --format json import repository --repository "$LAB/work/repo-multi" --select alpha \| jq .` | exit 0; **`kind="imported_batch"`** with one import whose `skill_name=repo-alpha` (any `--select` goes through the batch path; `kind="imported"` is only for the no-`--select` single-skill case) |
 | 7.4 batch | `si --format json import repository --repository "$LAB/work/repo-multi" --select alpha --select beta \| jq .` | exit 0; `kind="imported_batch"`; `imports` length 2 |
 | 7.5 dup select | `--select alpha --select alpha` | exit 1; `... a skill was selected more than once` |
 | 7.6 dup name | two distinct subdirs whose `SKILL.md` names collide, both selected | exit 1; `... two selected skills resolve to the same name` |
 | 7.7 missing select | `--select does-not-exist` | exit 1; `... the selected skill was not found in the repository` |
 | 7.8 empty repo | repo dir with no valid skills | exit 1; `... contains no valid skills` |
 | 7.9 invalid root SKILL.md | repo whose root `SKILL.md` is malformed (and has valid nested skills) | exit 1 — must **fail**, not skip the root and import nested |
-| 7.10 depth limit | place a valid skill at depth 9; scan a repo where it is the only one | exit 1; `... beyond the repository scan depth limit` (a skill at depth ≤8 is found) |
+| 7.10 depth limit | place a valid skill at depth 9 as the only skill | exit 1; `... contains no valid skills` — skills beyond depth 8 are **silently skipped** (per spec), so a depth-9-only repo reads as empty; a separate repo with a depth-8 skill imports it, confirming the boundary |
 | 7.11 imports collision | import `repo-alpha`, then re-select it | exit 1; existing imports-root collision before any write |
 | 7.12 batch rollback | force a later write to fail in a 2-item batch (e.g. pre-create a read-only dir collision for the 2nd) | exit 1; the **first** import is rolled back — `ls $LAB/imports` shows neither |
 | 7.13 git url (live) | `si import repository --repository https://github.com/<small-skill-repo>.git` | clones depth 1; selection/import per repo contents |
@@ -512,14 +531,14 @@ unavailable (note which in the sign-off table).
 
 - [ ] 7.1 root skill → `kind=imported`, `skill_path="."`
 - [ ] 7.2 selection (multi, no select) → `kind=selection`, no storage
-- [ ] 7.3 single `--select` → `kind=imported`
+- [ ] 7.3 single `--select` → `kind=imported_batch` (one import)
 - [ ] 7.4 batch `--select`×2 → `kind=imported_batch`, length 2
 - [ ] 7.5 duplicate selection → exit 1
 - [ ] 7.6 duplicate resolved name → exit 1
 - [ ] 7.7 missing selection → exit 1
 - [ ] 7.8 empty repo → exit 1
 - [ ] 7.9 invalid root `SKILL.md` → exit 1 (fail, not skip)
-- [ ] 7.10 depth limit (skill at depth 9) → exit 1; depth ≤8 found
+- [ ] 7.10 depth limit (depth-9-only repo) → exit 1 `contains no valid skills`; depth-8 skill found
 - [ ] 7.11 imports-root collision → exit 1 before any write
 - [ ] 7.12 batch rollback: later write fails → no earlier write survives
 - [ ] 7.13 git URL (live) → clones depth 1
