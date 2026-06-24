@@ -17,7 +17,7 @@ const types = @import("types.zig");
 const result = @import("result.zig");
 const frontmatter = @import("frontmatter.zig");
 const manifest = @import("manifest.zig");
-const fsutil = @import("fsutil.zig");
+const managed_entry = @import("managed_entry.zig");
 
 /// Absolute paths of the four roots (cli-clean-room-spec.md "Root Resolution").
 pub const Roots = struct {
@@ -174,7 +174,7 @@ fn scanAgent(
 
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        const status = (try classifyAgentEntry(arena, io, dir, entry, root_path, roots)) orelse continue;
+        const status = (try classifyAgentEntry(arena, io, entry, root_path, roots)) orelse continue;
         // A skill seen ONLY via an agent root is agent_only (getOrPut default);
         // storage roots already set canonical/imported, which take precedence and
         // are never downgraded here.
@@ -189,69 +189,43 @@ fn scanAgent(
 /// Classify a single agent-root entry into an AgentEntryStatus
 /// (spec "Inventory": agent_entries values). Returns null for entries that do
 /// not represent a skill (e.g. a stray regular file), which are skipped.
+///
+/// Thin adapter over `managed_entry.classify`: the no-follow classify, broken-
+/// link probe (Finding #9), and symlinked-ancestor canonicalization live in that
+/// shared module; this only maps a `Classification` onto the inventory token.
 fn classifyAgentEntry(
     arena: std.mem.Allocator,
     io: std.Io,
-    dir: std.Io.Dir,
     entry: std.Io.Dir.Entry,
     root_path: []const u8,
     roots: Roots,
 ) !?types.AgentEntryStatus {
-    switch (entry.kind) {
-        .directory => return .skill_directory,
-        .sym_link => {
-            // Broken unless the target RESOLVES (follow the link end-to-end). Only
-            // a successful stat means the target is reachable; ANY error means the
-            // target cannot be resolved — FileNotFound (dangling), SymLinkLoop,
-            // AccessDenied through the chain, etc. A symlink whose target cannot be
-            // resolved is broken, NOT external (spec "Terms": an External entry is
-            // a symlink to a target OUTSIDE managed roots — one that resolves but
-            // lands elsewhere; spec "Inventory": broken_symlink has enablement
-            // false). Classifying an unresolvable link as external_symlink would
-            // wrongly report enablement=true (Finding #9).
-            const resolves = blk: {
-                _ = dir.statFile(io, entry.name, .{ .follow_symlinks = true }) catch break :blk false;
-                break :blk true;
-            };
-            if (!resolves) return .broken_symlink;
-
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const n = try dir.readLink(io, entry.name, &buf);
-            const link_dir = try canonRootOrLexical(arena, io, root_path);
-            const lexical_target = try fsutil.resolveLinkTarget(arena, link_dir, buf[0..n]);
-            // Resolve the target with the SAME policy as the roots below
-            // (canonicalizeExistingAncestor realpaths existing ancestors, so any
-            // intermediate symlink component is resolved). Resolving only one
-            // side would prefix-compare a realpath against an un-resolved spelling
-            // and misclassify a managed symlink reached through a symlinked
-            // ancestor (e.g. macOS /tmp->/private/tmp, a symlinked $HOME) as
-            // external_symlink (spec "Inventory": canonical_symlink/
-            // imported_symlink; "Terms": External entry).
-            const target = try canonRootOrLexical(arena, io, lexical_target);
-
-            const canon = try canonRootOrLexical(arena, io, roots.canonical);
-            const imports = try canonRootOrLexical(arena, io, roots.imports);
-            if (isInside(target, canon)) return .canonical_symlink;
-            if (isInside(target, imports)) return .imported_symlink;
-            return .external_symlink;
-        },
+    const link_path = try std.fs.path.join(arena, &.{ root_path, entry.name });
+    switch (try managed_entry.classify(arena, io, link_path)) {
+        // Iteration only yields existing entries, so `.missing` is unreachable in
+        // practice; map it to "skip" for totality.
+        .missing => return null,
+        .real_directory => return .skill_directory,
         // A stray regular file (or other non-skill entry) is not a managed skill
         // and has no inventory token; skip it.
-        else => return null,
+        .real_file => return null,
+        // An unresolvable link is broken, NOT external (Finding #9): broken has
+        // enablement false; External (a resolvable link landing outside the roots)
+        // has enablement true.
+        .broken_symlink => return .broken_symlink,
+        .symlink => |target| {
+            // Membership against the roots, canonicalized with the SAME policy
+            // managed_entry applied to the target, so a managed link reached
+            // through a symlinked ancestor is not misreported as external_symlink
+            // (spec "Inventory": canonical_symlink/imported_symlink; "Terms":
+            // External entry).
+            const canon = try managed_entry.canonicalize(arena, io, roots.canonical);
+            const imports = try managed_entry.canonicalize(arena, io, roots.imports);
+            if (managed_entry.isInside(target, canon)) return .canonical_symlink;
+            if (managed_entry.isInside(target, imports)) return .imported_symlink;
+            return .external_symlink;
+        },
     }
-}
-
-/// Resolve a root to a canonical absolute path if it exists, else lexically.
-fn canonRootOrLexical(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
-    return fsutil.canonicalizeExistingAncestor(arena, io, path) catch
-        std.fs.path.resolve(arena, &.{path});
-}
-
-/// True iff `path` is `root` itself or lies inside `root`.
-fn isInside(path: []const u8, root: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, root)) return false;
-    if (path.len == root.len) return true;
-    return path[root.len] == std.fs.path.sep;
 }
 
 /// Open `path` as an iterable directory. A missing root yields null (spec "list":
