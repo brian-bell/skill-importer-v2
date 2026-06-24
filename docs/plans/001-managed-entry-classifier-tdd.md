@@ -1,6 +1,6 @@
 # Plan A — Deepen the managed-entry classifier (TDD)
 
-**Status:** proposed
+**Status:** implemented (branch `feat/managed-entry-classifier`)
 **Candidate:** A (Strong) from the 2026-06-23 architecture review
 **Glossary:** module / interface / depth / seam / adapter / leverage / locality (see `improve-codebase-architecture/LANGUAGE.md`)
 
@@ -65,7 +65,7 @@ pub fn classify(arena: std.mem.Allocator, io: std.Io, link_path: []const u8) !Cl
 
 /// Canonicalize `path` through existing ancestors, falling back to a lexical resolve
 /// for a not-yet-existing path. (The `canonOrLexical` / `canonRootOrLexical` policy.)
-pub fn canonicalize(arena: std.mem.Allocator, io: std.Io, path: []const u8) []const u8;
+pub fn canonicalize(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8;
 
 /// True iff `path` is `root` itself or lies strictly inside it (component-aware: a
 /// sibling like `<root>-evil` is NOT inside `<root>`).
@@ -177,11 +177,34 @@ unsafe-entry / Finding #8 / Finding #4 cases now flow through the shared classif
 
 ## 6. Behavior-preservation strategy
 
-This is a **pure refactor** — no spec behavior changes. The safety net is the existing
-`discovery_test`, `ops_test`, `promote_test`, `cli_integration_test`, which must pass with
-**zero edits**. If any requires editing, treat it as a regression and stop: the classifier
-diverged from one of the two original implementations. The new `managed_entry_test` adds
-unit-level coverage that did not previously exist (the interface as test surface).
+This is a **near-pure refactor** — no spec behavior changes, with **one intentional,
+documented exception** (below). The safety net is the existing `discovery_test`,
+`ops_test`, `promote_test`, `cli_integration_test`, which must pass with **zero edits**.
+If any requires editing, treat it as a regression and stop: the classifier diverged from
+one of the two original implementations. The new `managed_entry_test` adds unit-level
+coverage that did not previously exist (the interface as test surface).
+
+### Intentional divergence (Finding #8/#9 unification)
+
+The original ops helpers (`symlinkPointsAt`/`symlinkPointsAtCanon`) compared a link's
+canonicalized lexical target for **equality WITHOUT a resolvability probe**, whereas
+`managed_entry.classify` reports any unresolvable link as `.broken_symlink` *before* a
+target is ever produced. These agree for every entry the existing tests exercise, with one
+reachable corner case: in `preflightPromoteAgent`, a **dangling** agent symlink whose
+stored target is the not-yet-existing canonical dest `<canonical>/<name>` (a corrupt state,
+e.g. the canonical copy deleted out-of-band before a re-promote).
+
+- Old ops: lexical-equal to `dest_canon` → treated as "already correct", promote **proceeds**
+  and silently self-heals the dangling link.
+- New (unified): `.broken_symlink` → **unsafe**, promote **fails** and leaves the link
+  untouched.
+
+The new behavior is adopted deliberately: it makes `ops` agree with `discovery`, which
+already classifies the same link as `broken_symlink`, and it is consistent with Finding #8
+(a broken managed link is left untouched) and Finding #9 (an unresolvable link is broken,
+not external). This is the *entire point* of the consolidation — eliminating the
+hand-maintained agreement between the two copies. It is locked by a new `promote_test`
+case ("a dangling agent symlink pointing at the FUTURE canonical dest is unsafe").
 
 ## 7. Risks & mitigations
 
@@ -195,10 +218,11 @@ unit-level coverage that did not previously exist (the interface as test surface
 
 ## 8. Done criteria
 
-- [ ] `src/managed_entry.zig` + `src/managed_entry_test.zig` exist and are registered.
-- [ ] `discovery` and `ops` contain no symlink-membership/canonicalization logic of their
+- [x] `src/managed_entry.zig` + `src/managed_entry_test.zig` exist and are registered.
+- [x] `discovery` and `ops` contain no symlink-membership/canonicalization logic of their
       own — only mapping from `Classification`.
-- [ ] All pre-existing tests pass unedited; new unit tests cover Steps 1–3.
-- [ ] `make check` is green.
-- [ ] `commit` skill run (plan + implementation in logical commits on a feature branch,
+- [x] All pre-existing tests pass unedited; new unit tests cover Steps 1–3. (One *new*
+      `promote_test` case was added to lock the intentional Finding #8/#9 divergence in §6.)
+- [x] `make check` is green.
+- [x] `commit` skill run (plan + implementation in logical commits on a feature branch,
       never on `main`).

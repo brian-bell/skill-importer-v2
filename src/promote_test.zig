@@ -1023,6 +1023,38 @@ test "promote: a BROKEN agent symlink for the skill fails before mutation (spec 
     try testing.expectEqual(std.Io.File.Kind.sym_link, (try entryKind(&h, "claude/brk-p")).?);
 }
 
+// A DANGLING agent symlink whose stored target is the not-yet-existing canonical
+// dest `<canonical>/<name>` is unsafe: promote fails before mutation and leaves
+// the link untouched. The managed_entry classifier treats any unresolvable link
+// as `.broken_symlink` (Finding #9) and rejects it BEFORE the lexical pointing-at
+// test, so a broken link that happens to match the future canonical path is
+// surfaced as a corrupt state for the operator to repair — consistent with how
+// discovery reports the SAME link (broken_symlink) and with Finding #8 (a broken
+// managed link is left untouched). This is the one case where the unified policy
+// is intentionally stricter than the pre-refactor ops helper, which compared the
+// link target lexically WITHOUT a resolvability probe and would have silently
+// proceeded (self-healing the dangling link). Locked here so the verdict cannot
+// drift back.
+test "promote: a dangling agent symlink pointing at the FUTURE canonical dest is unsafe (Finding #8/#9)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try draft(&h, "dgl-p", "dgl-p", "Dangling draft.");
+    // Stored target == the canonical copy promote WOULD create; it does not exist
+    // yet (first-time promote), so the link is dangling/broken.
+    const future_dest = try canonicalPath(&h, "dgl-p");
+    try testing.expectEqual(@as(?std.Io.File.Kind, null), try entryKind(&h, "canonical/dgl-p"));
+    try h.fixtures().symlink(future_dest, "claude/dgl-p");
+    var c = h.ctx();
+
+    try expectErrKind(ops.promote(&c, "dgl-p", false), .unsafe_agent_entry);
+    // Nothing mutated: no canonical copy, manifest still unpromoted, link intact.
+    try testing.expectEqual(@as(?std.Io.File.Kind, null), try entryKind(&h, "canonical/dgl-p"));
+    const man = try readManifest(&h, "imports/dgl-p");
+    try testing.expect(!man.promoted);
+    try testing.expectEqual(std.Io.File.Kind.sym_link, (try entryKind(&h, "claude/dgl-p")).?);
+    try testing.expectEqualStrings(future_dest, try linkTarget(&h, "claude/dgl-p"));
+}
+
 test "promote: a WRONG-managed-target agent symlink for the skill fails before mutation (spec promote)" {
     var h = try Harness.init();
     defer h.deinit();
