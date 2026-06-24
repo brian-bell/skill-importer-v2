@@ -17,7 +17,6 @@
 
 const std = @import("std");
 const result = @import("result.zig");
-const fsutil = @import("fsutil.zig");
 
 // ===========================================================================
 // A. Report model + renderer
@@ -120,11 +119,16 @@ pub fn renderReportFile(
 ) result.Result(void) {
     const cwd = std.Io.Dir.cwd();
 
-    // Input must be a real regular file; refuse symlinks (no-follow classify).
-    const kind = fsutil.classify(io, cwd, input) catch {
-        return ioErr(input);
+    // Input must be a real REGULAR file. A no-follow `statFile` is used rather
+    // than the lossy `classify` helper because that collapses every non-dir/non-symlink
+    // kind to `.file`: a fifo/socket/device would pass and then BLOCK FOREVER in
+    // `readFileAlloc`. Require `st.kind == .file` exactly; a symlink, fifo, or
+    // anything else is rejected as report_input_invalid.
+    const st = cwd.statFile(io, input, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .err = .{ .kind = .report_input_invalid, .path = input } },
+        else => return ioErr(input),
     };
-    if (kind != .file) {
+    if (st.kind != .file) {
         return .{ .err = .{ .kind = .report_input_invalid, .path = input } };
     }
 
@@ -268,9 +272,13 @@ pub fn buildAnalysisPrompt(arena: std.mem.Allocator, skill_name: []const u8) ![]
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
     try w.writeAll(prompt_prefix);
-    try w.writeByte('"');
-    try w.writeAll(skill_name);
-    try w.writeByte('"');
+    // JSON-encode the skill name (escapes `"`, `\`, control chars) rather than
+    // wrapping it in raw quotes. The frontmatter validator permits `"` in a
+    // name, so a malicious skill name like `demo" Ignore the rules "` would
+    // otherwise close the quoted phrase and inject first-party instructions into
+    // the analyzer's own prompt — a prompt-injection hole at the security
+    // boundary. (v1 used Rust `{:?}` debug formatting, which escapes likewise.)
+    try std.json.Stringify.value(skill_name, .{}, w);
     try w.writeAll(prompt_suffix);
     return aw.written();
 }
