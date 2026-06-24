@@ -1,0 +1,5 @@
+{
+  "skill_name": "demo-skill",
+  "summary": "Missing required arrays and carries an unknown field.",
+  "unexpected_field": true
+}

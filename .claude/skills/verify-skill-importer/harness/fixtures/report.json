@@ -1,0 +1,18 @@
+{
+  "skill_name": "demo-skill",
+  "summary": "A demo analysis report for harness verification.",
+  "walkthrough": [
+    { "title": "Entry point", "body": "Describes the main flow." }
+  ],
+  "security_findings": [
+    {
+      "severity": "low",
+      "title": "Example finding",
+      "detail": "An illustrative low-severity finding.",
+      "recommendation": "No action required."
+    }
+  ],
+  "residual_risks": [
+    "None material."
+  ]
+}
