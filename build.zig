@@ -44,4 +44,25 @@ pub fn build(b: *std.Build) void {
     run_tests.step.dependOn(b.getInstallStep());
     const test_step = b.step("test", "Run the test suite");
     test_step.dependOn(&run_tests.step);
+
+    const harness_unit_tests = b.addSystemCommand(&.{
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        ".claude/skills/verify-skill-importer/harness",
+        "-p",
+        "test_harness.py",
+    });
+
+    const blackbox_tests = b.addSystemCommand(&.{
+        "python3",
+        ".claude/skills/verify-skill-importer/harness/run.py",
+    });
+    blackbox_tests.step.dependOn(b.getInstallStep());
+    blackbox_tests.step.dependOn(&harness_unit_tests.step);
+
+    const blackbox_step = b.step("blackbox-test", "Run the black-box verification suite");
+    blackbox_step.dependOn(&blackbox_tests.step);
 }

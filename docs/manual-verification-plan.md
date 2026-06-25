@@ -1,11 +1,24 @@
-# Manual Verification Plan — `skill-importer` CLI
+# Black-Box Verification Suite — `skill-importer` CLI
 
-A hands-on, end-to-end checklist for exercising the entire `skill-importer` CLI
-against a built binary. This complements the automated suite (`zig build test`):
-the automated tests run hermetically against injected providers and temp roots;
-this plan drives the **real binary** with the **real net/git providers** against
-**disposable sandbox roots**, so an operator can confirm the shipped artifact
-behaves as the [clean-room spec](./cli-clean-room-spec.md) requires.
+An end-to-end black-box suite for exercising the entire `skill-importer` CLI
+against a built binary. This complements `zig build test`: the Zig tests run
+hermetically against injected providers and temp roots; this suite drives the
+**real binary** with the **real net/git providers** against **disposable sandbox
+roots**, so the shipped artifact is checked against the
+[clean-room spec](./cli-clean-room-spec.md).
+
+Run the suite with:
+
+```sh
+make blackbox-test
+```
+
+For targeted or environment-specific runs, invoke the harness directly:
+
+```sh
+python3 .claude/skills/verify-skill-importer/harness/run.py --only 3 4
+python3 .claude/skills/verify-skill-importer/harness/run.py --git-url https://github.com/<small-skill-repo>.git
+```
 
 The spec is normative. Where this plan and the spec disagree, the spec wins.
 `--format json` is the normative output; text output is illustrative only.
@@ -33,12 +46,13 @@ The spec is normative. Where this plan and the spec disagree, the spec wins.
 | ----------- | ----- |
 | Zig 0.16.0  | `zig version` → `0.16.0` |
 | Build       | `make build` → produces `zig-out/bin/skill-importer` |
-| Suite green | `make check` (fmt + tests) passes before manual work |
+| Suite green | `make check` (fmt + tests) passes before black-box work |
 | `git` CLI   | needed for all `import repository` cases — the provider always `git clone`s, even a local path, so fixtures must be real git repos (§7, esp. the live Git-URL case §7.13) |
 | macOS       | needed only for the live `analyze` case (§11.2) |
 | Network     | needed only for the live `import url` case (§5) |
 
-Build once:
+The `blackbox-test` target builds the binary before running the harness. For
+manual case reproduction, build once:
 
 ```sh
 cd /Users/brian/dev/skill-importer-2
@@ -97,6 +111,10 @@ mk_canonical() {
 ```
 
 ### How to read each case
+
+The Python harness under `.claude/skills/verify-skill-importer/harness/` is the
+normal runner for every case below. The shell snippets remain as executable
+documentation for reproducing or debugging an individual failure by hand.
 
 For every case, confirm **all** of:
 
@@ -637,19 +655,20 @@ unavailable (note which in the sign-off table).
 
 | Section | Pass / Fail / N/A | Notes |
 | ------- | ----------------- | ----- |
-| 3 Global parsing | Pass | 11/11 |
-| 4 import markdown | Pass | 11/11 |
-| 5 import url (live) | Pass | 6/6 (in-process HTTP server; 5.3/5.6 always run) |
-| 6 import path | Pass | 9/9 |
-| 7 import repository | Pass | 12/12 deterministic; 7.13 (live git URL) N/A — no `--git-url`; 7.12 (batch rollback) INDETERMINATE — postcondition asserted, mid-write rollback not externally forceable |
-| 8 enable / disable | Pass | 14/14 |
-| 9 promote / unpromote / delete | Pass | 19/19 deterministic; 9.11 (overwrite safety) INDETERMINATE — happy path only, mid-copy failure not simulable externally |
-| 10 root resolution | Pass | 7/7 |
-| 11 non-spec (render / analyze / tui) | Pass | 12/12 deterministic; macOS build so 11.2a N/A; 11.2d (real `codex exec` launch) INDETERMINATE — verify by hand |
-| 12 list integration | Pass | 9/9 |
-| 13 output contract | Pass | Cross-cutting assertions enforced per case; no real user root touched (sandbox `HOME` + all four roots) |
+| 3 Global parsing |  |  |
+| 4 import markdown |  |  |
+| 5 import url (live) |  |  |
+| 6 import path |  |  |
+| 7 import repository |  |  |
+| 8 enable / disable |  |  |
+| 9 promote / unpromote / delete |  |  |
+| 10 root resolution |  |  |
+| 11 non-spec (render / analyze / tui) |  |  |
+| 12 list integration |  |  |
+| 13 output contract |  |  |
 
-Verified via the `verify-skill-importer` harness: `plan=115 run=115` (no
-missing/extra case ids), **0 FAIL**, 2 N/A, 3 INDETERMINATE.
+Fill this table from the harness output. The machine-readable `SUMMARY §N pass
+fail na indeterminate` lines map directly to the rows above, and the `COVERAGE`
+line must report no missing or extra case ids for a full run.
 
-Tester: verify-skill-importer harness (run by Brian Bell)   Binary SHA (`git rev-parse HEAD`): fc6485b077684a86d1e3f265d1ab50f4e3625723   Binary content hash: sha256:0e5d5aebdda38120c15d99858acbfd99170332f19da87dea7810dba28cb8ee81   Date: 2026-06-24
+Tester:    Git commit:    Binary content hash:    Date:

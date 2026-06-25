@@ -1,10 +1,13 @@
-.PHONY: build test fmt-check check run-list run-tui
+.PHONY: build test blackbox-test fmt-check check run-list run-tui
 
 build:
 	zig build
 
 test:
 	zig build test
+
+blackbox-test:
+	zig build blackbox-test
 
 fmt-check:
 	zig fmt --check src

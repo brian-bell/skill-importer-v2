@@ -51,6 +51,12 @@ def plan_case_ids(text):
     return set(_ID_RE.findall(text))
 
 
+def plan_coverage_diff(plan_text, run_ids):
+    """Return sorted (missing, extra) ids between the markdown plan and a full run."""
+    plan_ids = plan_case_ids(plan_text)
+    return sorted(plan_ids - run_ids), sorted(run_ids - plan_ids)
+
+
 class Sandbox:
     """One mkdtemp tree with all four roots + HOME, guaranteeing isolation."""
 

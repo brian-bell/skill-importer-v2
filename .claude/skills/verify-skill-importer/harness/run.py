@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from harness import Sandbox, Cli, Reporter, plan_case_ids
+from harness import Sandbox, Cli, Reporter, plan_case_ids, plan_coverage_diff
 
 import cases.s03_global as s03
 import cases.s04_import_markdown as s04
@@ -86,6 +86,7 @@ def preflight(repo, rebuild):
 
 def report(rep, repo, binp, partial):
     tallies = rep.section_tallies()
+    coverage_failed = False
     print("\n=== Verification summary ===")
     for sec in sorted(tallies, key=lambda s: int(s)):
         t = tallies[sec]
@@ -106,13 +107,15 @@ def report(rep, repo, binp, partial):
     if partial:
         print("COVERAGE skipped (partial run via --only)")
     elif plan.exists():
-        plan_ids = plan_case_ids(plan.read_text())
-        run_ids = rep.executed_ids()
-        missing = sorted(plan_ids - run_ids)
-        extra = sorted(run_ids - plan_ids)
+        plan_text = plan.read_text()
+        missing, extra = plan_coverage_diff(plan_text, rep.executed_ids())
+        coverage_failed = bool(missing or extra)
         print("COVERAGE plan={} run={} missing={} extra={}".format(
-            len(plan_ids), len(run_ids),
+            len(plan_case_ids(plan_text)), len(rep.executed_ids()),
             ",".join(missing) or "-", ",".join(extra) or "-"))
+    else:
+        coverage_failed = True
+        print("COVERAGE plan missing: {}".format(plan))
     # BINARY_SHA identifies the bytes that were tested (NOT the git commit). The
     # commit + dirty flag are reported separately for traceability.
     try:
@@ -126,6 +129,7 @@ def report(rep, repo, binp, partial):
         print("GIT_COMMIT <git unavailable>")
     else:
         print("GIT_COMMIT {}{}".format(head, "-dirty" if dirty else ""))
+    return coverage_failed
 
 
 def main():
@@ -163,9 +167,9 @@ def main():
         if not args.only or "11" in args.only:
             g_analyze.run(cli, sb, rep)
     finally:
-        report(rep, repo, binp, partial=bool(args.only))
+        coverage_failed = report(rep, repo, binp, partial=bool(args.only))
         sb.cleanup()
-    sys.exit(rep.exit_code())
+    sys.exit(1 if coverage_failed else rep.exit_code())
 
 
 if __name__ == "__main__":
