@@ -43,6 +43,7 @@ The `Makefile` wraps the common `zig build` invocations:
 | ---------------- | ------------------------- | ---------------------------------------- |
 | `make build`     | `zig build`               | Compile the `skill-importer` binary.     |
 | `make test`      | `zig build test`          | Run the full test suite.                 |
+| `make blackbox-test` | `zig build blackbox-test` | Run the black-box verification suite. |
 | `make fmt-check` | `zig fmt --check src`     | Verify formatting without rewriting.     |
 | `make check`     | `fmt-check` then `test`   | The pre-commit / CI gate.                |
 | `make run-list`  | `zig build run -- list`   | Build and run `list`.                    |
@@ -52,14 +53,21 @@ The built binary is written to `./zig-out/bin/skill-importer`. The test suite is
 the primary oracle: the integration tests exec the real binary against
 **disposable temp roots only** — never real user roots.
 
-For end-to-end **acceptance** checking,
+For end-to-end **black-box** checking,
 [`docs/manual-verification-plan.md`](./docs/manual-verification-plan.md) is a
-115-case black-box checklist that drives the built binary with the real net/git
-providers. The bundled `verify-skill-importer` skill runs it for you against
-disposable sandbox roots (no real user root is touched):
+115-case suite that drives the built binary with the real net/git providers.
+The bundled `verify-skill-importer` harness runs it against disposable sandbox
+roots (no real user root is touched):
 
 ```sh
-python3 .claude/skills/verify-skill-importer/harness/run.py
+make blackbox-test
+```
+
+Use the harness directly for options such as `--only`, `--git-url`, or
+`--no-url`:
+
+```sh
+python3 .claude/skills/verify-skill-importer/harness/run.py --only 3 4
 ```
 
 CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) pins Zig to 0.16.0
@@ -222,13 +230,13 @@ printf '%s\n' '---' 'name: demo' 'description: a demo skill' '---' \
 ## Project layout
 
 ```text
-build.zig          # build graph: exe, `run` step, and `test` step
+build.zig          # build graph: exe, `run`, `test`, and `blackbox-test` steps
 build.zig.zon      # package manifest; pins minimum_zig_version 0.16.0
-Makefile           # build / test / fmt-check / check / run-list / run-tui
+Makefile           # build / test / blackbox-test / fmt-check / check / run-list / run-tui
 .github/workflows/ # CI: pinned Zig 0.16.0 + fmt-check + test
 src/               # CLI source and tests (root_test.zig is the test entry)
 docs/cli-clean-room-spec.md   # normative product contract and data model
-docs/manual-verification-plan.md  # 115-case black-box acceptance checklist
+docs/manual-verification-plan.md  # 115-case black-box suite plan
 docs/plans/                   # implementation plan + follow-up TDD plans
-.claude/skills/verify-skill-importer/  # Python harness that runs the checklist
+.claude/skills/verify-skill-importer/  # Python harness that runs the suite
 ```

@@ -1,16 +1,16 @@
 ---
 name: verify-skill-importer
-description: Run the skill-importer manual verification checklist against the real built binary in disposable sandbox roots. Use when asked to verify, sign off on, smoke-test, or acceptance-test the skill-importer CLI before shipping a build.
+description: Run the skill-importer black-box verification suite against the real built binary in disposable sandbox roots. Use when asked to verify, sign off on, smoke-test, or acceptance-test the skill-importer CLI before shipping a build.
 user_invocable: true
 ---
 
 # Verify skill-importer
 
-Runs `docs/manual-verification-plan.md` (115 cases) against the **real built
-`skill-importer` binary** as black-box acceptance coverage, complementing the
-hermetic `zig build test` unit suite. A bundled Python harness defines the
-sandbox helpers once and asserts exit code / stderr / JSON / filesystem per case,
-printing PASS / FAIL / N/A / INDETERMINATE and a machine-readable summary.
+Runs the `docs/manual-verification-plan.md` black-box suite (115 cases) against
+the **real built `skill-importer` binary**, complementing the hermetic
+`zig build test` unit suite. A bundled Python harness defines the sandbox helpers
+once and asserts exit code / stderr / JSON / filesystem per case, printing PASS /
+FAIL / N/A / INDETERMINATE and a machine-readable summary.
 
 **Hard safety rule:** the harness only ever touches a `mktemp` sandbox — all four
 roots plus `HOME` are overridden to disposable temp dirs. It must NEVER be
@@ -23,9 +23,17 @@ pointed at real user roots (`~/.claude/skills`, `~/.agents/skills`,
 2. `zig version` must be `0.16.0` — the harness aborts with **exit 2** otherwise
    (distinct from exit 1 = a case FAIL, so a sign-off can tell an environment
    gate apart from a regression).
-3. The binary is built on demand (`make build`); pass `--rebuild` to force it.
+3. The binary is built on demand by `make blackbox-test` / `zig build blackbox-test`;
+   pass `--rebuild` to the harness directly to force a rebuild.
 
 ## Run it
+
+```sh
+make blackbox-test
+```
+
+The Make target runs the harness unit tests first, then the 115-case black-box
+suite. Use the harness directly for targeted or environment-specific runs:
 
 ```sh
 python3 .claude/skills/verify-skill-importer/harness/run.py
@@ -39,8 +47,11 @@ Useful flags:
 - `--only N ...` — run just some sections, e.g. `--only 3 4 12`.
 
 Read the harness's PASS/FAIL summary; do not re-derive cases by hand. Its unit
-tests (`python3 -m unittest test_harness`, run from the `harness/` dir) cover the
-assertion library itself.
+tests cover the assertion library and coverage-drift reporting:
+
+```sh
+python3 -m unittest discover -s .claude/skills/verify-skill-importer/harness -p test_harness.py
+```
 
 ## Outcomes
 
@@ -69,7 +80,8 @@ assertion library itself.
 Map the machine-readable `SUMMARY §N pass fail na indet` lines to the plan's §15
 sign-off table (Pass/Fail/N-A + notes per section), and record the `BINARY_SHA`.
 The `COVERAGE plan=N run=M missing=… extra=…` line proves the harness still
-mirrors every plan case id — investigate any `missing`/`extra`.
+mirrors every plan case id; any `missing`/`extra`, or a missing plan file, makes a
+full run fail. Partial `--only` runs skip coverage enforcement intentionally.
 
 ## Layout
 

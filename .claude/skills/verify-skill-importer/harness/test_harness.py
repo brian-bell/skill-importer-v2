@@ -14,10 +14,22 @@ integration test.)
 
 import json
 import os
+import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
-from harness import Sandbox, Reporter, Result, section_of, plan_case_ids
+import run as run_py
+
+from harness import (
+    Sandbox,
+    Reporter,
+    Result,
+    section_of,
+    plan_case_ids,
+    plan_coverage_diff,
+)
 
 
 class TestSandbox(unittest.TestCase):
@@ -243,6 +255,79 @@ class TestPlanCaseIds(unittest.TestCase):
         self.assertIn("11.2a", ids)
         # The checklist bullet shares id 3.1; set dedups, so still 2 unique.
         self.assertEqual(len(ids), 2)
+
+    def test_plan_coverage_diff_reports_missing_and_extra_ids(self):
+        plan = "\n".join(
+            [
+                "| # | Command | Expect |",
+                "| - | ------- | ------ |",
+                "| 3.1 | `si list` | exit 0 |",
+                "| 3.2 | json list | exit 0 |",
+            ]
+        )
+        missing, extra = plan_coverage_diff(plan, {"3.1", "9.9"})
+        self.assertEqual(missing, ["3.2"])
+        self.assertEqual(extra, ["9.9"])
+
+
+class TestRunReportCoverage(unittest.TestCase):
+    def _report(self, repo, rep, partial=False):
+        binp = repo / "skill-importer"
+        binp.write_bytes(b"binary")
+        out = StringIO()
+        with redirect_stdout(out):
+            failed = run_py.report(rep, repo, binp, partial=partial)
+        return failed, out.getvalue()
+
+    def test_full_report_fails_on_coverage_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "manual-verification-plan.md").write_text(
+                "| # | Command | Expect |\n"
+                "| - | ------- | ------ |\n"
+                "| 3.1 | `si list` | exit 0 |\n"
+                "| 3.2 | json list | exit 0 |\n"
+            )
+            rep = Reporter()
+            with rep.case("3.1", "list") as c:
+                c.exit(Result(0, "", ""), 0)
+
+            failed, output = self._report(repo, rep)
+
+        self.assertTrue(failed)
+        self.assertIn("COVERAGE plan=2 run=1 missing=3.2 extra=-", output)
+
+    def test_partial_report_skips_coverage_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "manual-verification-plan.md").write_text(
+                "| # | Command | Expect |\n"
+                "| - | ------- | ------ |\n"
+                "| 3.1 | `si list` | exit 0 |\n"
+                "| 3.2 | json list | exit 0 |\n"
+            )
+            rep = Reporter()
+            with rep.case("3.1", "list") as c:
+                c.exit(Result(0, "", ""), 0)
+
+            failed, output = self._report(repo, rep, partial=True)
+
+        self.assertFalse(failed)
+        self.assertIn("COVERAGE skipped (partial run via --only)", output)
+
+    def test_full_report_fails_when_plan_is_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            rep = Reporter()
+            with rep.case("3.1", "list") as c:
+                c.exit(Result(0, "", ""), 0)
+
+            failed, output = self._report(repo, rep)
+
+        self.assertTrue(failed)
+        self.assertIn("COVERAGE plan missing", output)
 
 
 if __name__ == "__main__":
